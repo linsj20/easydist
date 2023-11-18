@@ -225,6 +225,7 @@ def rcpsp(task_data, available_resources, rec_dep_mask, method):
         resource_to_id[resource] = i
         resource_capacities.append(available_resources[resource])
 
+
     if method == 'general':
 
         transformed_task_data = rcpsp_data_transform(task_data, resource_to_id, resource_num)
