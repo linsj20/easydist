@@ -73,7 +73,7 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
     available_resources = {'comm': 1, 'comp': 1}
     if mem_constrain:
         available_resources['mem'] = int(0.95 * mdconfig.available_mem)
-    
+
     # whether resource release only until all nodes depended on it have finished
     resource_dep_mask = [0, 0, 1]
     precedence_relations = []
@@ -82,7 +82,7 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
     arg_list = []
     for node in fx_module.graph.nodes:
         duration = node.ed_info.normalized_int_runtime_ms
-        assert(duration > 0)
+        assert (duration > 0)
         if node.name.__contains__('arg'):
             arg_list.append(node)
             arg_num += 1
@@ -105,7 +105,8 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
                 mem_req = 0
                 for output_shape in output_shapes:
                     if output_shape.get('shape') is not None:
-                        mem_req += int(reduce(lambda x,y:x*y, output_shape['shape'], 1) * 4 / 1024)
+                        mem_req += int(
+                            reduce(lambda x, y: x * y, output_shape['shape'], 1) * 4 / 1024)
         if mem_constrain:
             resource.append(('mem', mem_req))
 
@@ -114,10 +115,10 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
             if not pre.name.__contains__('arg'):
                 precedence.append(pre)
         precedence_relations.append(precedence)
-        
+
         task_data.append((node, duration, precedence, resource))
 
-    assert(len(task_data) == len(fx_module.graph.nodes) - arg_num)
+    assert (len(task_data) == len(fx_module.graph.nodes) - arg_num)
 
     # only rank 0 process do the calculation
     if torch.distributed.get_rank() == 0:
@@ -133,7 +134,7 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
         logger.info(f"[RCPSP.time]:\t {time.perf_counter() - start_t} s.")
         logger.info('exit rcpsp')
 
-        assert(len(raw_sche) == len(fx_module.graph.nodes) - arg_num)
+        assert (len(raw_sche) == len(fx_module.graph.nodes) - arg_num)
     else:
         raw_sche = [None] * (len(fx_module.graph.nodes) - arg_num)
     torch.distributed.broadcast_object_list(raw_sche, src=0, device="cuda")
@@ -141,8 +142,8 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, shape_info, mem_constrain):
     node_sche = [task_data[i][0] for i in raw_sche]
 
     sche = arg_list + node_sche
-    
-    assert(len(sche) == len(fx_module.graph.nodes))
+
+    assert (len(sche) == len(fx_module.graph.nodes))
 
     return sche
 
@@ -180,30 +181,26 @@ def comm_nodes_group(fx_module, node_list, shape_info):
 
     with fx_module.graph.inserting_before(node_list[0]):
         comm_args = list(node_list[0].args[1:])
-        new_from_node = fx_module.graph.call_function(
-            comm_couple, args=tuple(from_nodes)
-        )
+        new_from_node = fx_module.graph.call_function(comm_couple, args=tuple(from_nodes))
         new_from_node.meta = create_meta_from_node(new_from_node)
         new_from_node.ed_info = EDInfo()
         new_from_node.ed_info.node_type = EDNodeType.COMPUTATION
         shape_info[new_from_node.name] = {'shape': torch.Size([total_size])}
 
         comm_op_name = _get_qualified_name(node_list[0].target)
-        new_comm_node = fx_module.graph.call_function(
-            eval(comm_op_name), 
-            args=tuple([new_from_node] + comm_args)
-        )
+        new_comm_node = fx_module.graph.call_function(eval(comm_op_name),
+                                                      args=tuple([new_from_node] + comm_args))
         new_comm_node.meta = create_meta_from_node(new_comm_node)
 
     with fx_module.graph.inserting_before(to_node):
-        new_to_node = fx_module.graph.call_function(
-            comm_decouple, args=(new_comm_node, tuple(retrive_points), tuple(retrive_shapes))
-        )
+        new_to_node = fx_module.graph.call_function(comm_decouple,
+                                                    args=(new_comm_node, tuple(retrive_points),
+                                                          tuple(retrive_shapes)))
         new_to_node.meta = create_meta_from_node(new_to_node)
         new_to_node.ed_info = EDInfo()
         new_to_node.ed_info.node_type = EDNodeType.COMPUTATION
         shape_info[new_to_node.name] = [{'shape': s} for s in retrive_shapes]
-        
+
     new_comm_node.ed_info = EDInfo()
     new_comm_node.ed_info.node_type = EDNodeType.COMMUNICATION
     new_comm_node.ed_info.comm_meta = {
@@ -211,12 +208,10 @@ def comm_nodes_group(fx_module, node_list, shape_info):
         'comm_vol': total_size,
         'comm_shape': torch.Size([total_size])
     }
-    
+
     for idx, (comm_node, to_node) in enumerate(zip(node_list, to_nodes)):
         with fx_module.graph.inserting_before(to_node):
-            retrive_node = fx_module.graph.call_function(
-                operator.getitem, args=(new_to_node, idx)
-            )
+            retrive_node = fx_module.graph.call_function(operator.getitem, args=(new_to_node, idx))
         to_node.replace_input_with(comm_node, retrive_node)
         retrive_node.meta = create_meta_from_node(retrive_node)
         retrive_node.ed_info = EDInfo()
@@ -260,7 +255,7 @@ def comm_group(fx_module, cap_limit, rg_limit, shape_info):
     retrive_node = None
     while idx >= 0:
         cur_range += 1
-        
+
         if (not sche[idx].ed_info.is_communication() and sche[idx] in comm_list_dep) \
             or cur_range > rg_limit \
             or cur_cap > cap_limit:
@@ -301,7 +296,11 @@ def comm_group(fx_module, cap_limit, rg_limit, shape_info):
     return fx_module
 
 
-def comm_optimize(fx_module: torch.fx.GraphModule, shape_info, sche_method, grouping=False, mem_restrain=False):
+def comm_optimize(fx_module: torch.fx.GraphModule,
+                  shape_info,
+                  sche_method,
+                  grouping=False,
+                  mem_restrain=False):
     '''
     This function performs multiple communciation optimizations on graph level
 
@@ -327,8 +326,10 @@ def comm_optimize(fx_module: torch.fx.GraphModule, shape_info, sche_method, grou
             from_node = node.all_input_nodes[0]
             comm_shape = shape_info[from_node.name]['shape']
             # TODO support mixed precision
-            node.ed_info.comm_meta = {'comm_vol': reduce(lambda x, y: x * y, comm_shape, 1) * 4,  #Bytes
-                                      'comm_shape': comm_shape}
+            node.ed_info.comm_meta = {
+                'comm_vol': reduce(lambda x, y: x * y, comm_shape, 1) * 4,  #Bytes
+                'comm_shape': comm_shape
+            }
         elif node.ed_info.is_computation():
             for pre in node.all_input_nodes:
                 if pre.ed_info.is_communication():
@@ -349,7 +350,7 @@ def comm_optimize(fx_module: torch.fx.GraphModule, shape_info, sche_method, grou
                 comm_map[from_node].append(node)
     elif sche_method == 'rcpsp':
         sche = rcpsp_schedule(fx_module, shape_info, mem_restrain)
-        
+
         _link_nodes(fx_module, sche)
 
         for idx, node in enumerate(sche):
@@ -362,8 +363,8 @@ def comm_optimize(fx_module: torch.fx.GraphModule, shape_info, sche_method, grou
                         comm_map[node].append(follower)
                     else:
                         break
-                assert(len(comm_map[node]) > 0)
-    
+                assert (len(comm_map[node]) > 0)
+
     def grouped_comm(input_tensors: list, comm_func: list, comm_args: list):
         res = []
         for input_tensor, comm_func, args in zip(input_tensors, comm_func, comm_args):
@@ -381,13 +382,15 @@ def comm_optimize(fx_module: torch.fx.GraphModule, shape_info, sche_method, grou
 
         # add grouped comm node
         with fx_module.graph.inserting_after(node):
-            new_comm_node = fx_module.graph.call_function(
-                grouped_comm, args=(input_nodes, comm_funcs, comm_args))
+            new_comm_node = fx_module.graph.call_function(grouped_comm,
+                                                          args=(input_nodes, comm_funcs,
+                                                                comm_args))
 
         # add retrive node
         for idx, comm_node in enumerate(comm_map[node]):
             with fx_module.graph.inserting_after(new_comm_node):
-                idx_node = fx_module.graph.call_function(operator.getitem, args=(new_comm_node, idx))
+                idx_node = fx_module.graph.call_function(operator.getitem,
+                                                         args=(new_comm_node, idx))
             comm_node.ed_info.comm_meta['to_node'].replace_input_with(comm_node, idx_node)
 
     # at this point all old comm operators should be eliminated
@@ -410,28 +413,28 @@ def _strategy_fill_up(opt_strategy, shape_info, fx_module):
                     idx = node.args[1]
                     pre_node = node.all_input_nodes[0]
                     opt_strategy[node.name] = {
-                        'node': node.name,
-                        'strategy': NodeSPMDStrategy(
+                        'node':
+                        node.name,
+                        'strategy':
+                        NodeSPMDStrategy(
                             VarSPMDStrategyGroup(
-                                opt_strategy[pre_node.name]['strategy'].get_invar_strtg(idx)
-                            ),
+                                opt_strategy[pre_node.name]['strategy'].get_invar_strtg(idx)),
                             VarSPMDStrategyGroup(
-                                opt_strategy[pre_node.name]['strategy'].get_outvar_strtg(idx)
-                            )
-                        )
+                                opt_strategy[pre_node.name]['strategy'].get_outvar_strtg(idx)))
                     }
                 elif not (node.name.__contains__("arg") or node.name.__contains__("output")):
                     # Assumption: nodes without strategy and not being args or output are constant tensor
                     opt_strategy[node.name] = {
-                        'node': node, 
-                        'strategy': NodeSPMDStrategy(
+                        'node':
+                        node,
+                        'strategy':
+                        NodeSPMDStrategy(
                             VarSPMDStrategyGroup(
-                                VarSPMDStrategy(*tuple([SPMD('REPLICATE')] * len(shape_info[node.name]['shape'])))
-                            ),
+                                VarSPMDStrategy(*tuple([SPMD('REPLICATE')] *
+                                                       len(shape_info[node.name]['shape'])))),
                             VarSPMDStrategyGroup(
-                                VarSPMDStrategy(*tuple([SPMD('REPLICATE')] * len(shape_info[node.name]['shape'])))
-                            )
-                        )    
+                                VarSPMDStrategy(*tuple([SPMD('REPLICATE')] *
+                                                       len(shape_info[node.name]['shape'])))))
                     }
 
     if mdconfig.log_level <= logging.DEBUG:
