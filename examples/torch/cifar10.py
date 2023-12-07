@@ -12,26 +12,10 @@ from torchvision.models import resnet18
 import torchvision.transforms as transforms
 
 from easydist import easydist_setup, mdconfig
-from easydist.torch.experimental.api import easydist_compile
+from easydist.torch.api import easydist_compile
 
 random.seed(42)
 torch.manual_seed(42)
-
-
-@easydist_compile
-def train_step(net, optimizer, inputs, labels):
-
-    criterion = nn.CrossEntropyLoss()
-
-    outputs = net(inputs)
-    loss = criterion(outputs, labels)
-    loss.backward()
-    optimizer.step()
-
-    optimizer.zero_grad()
-
-    return loss
-
 
 def main():
 
@@ -62,6 +46,20 @@ def main():
     net = resnet18().cuda()
 
     optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
+
+    @easydist_compile
+    def train_step(net, optimizer, inputs, labels):
+
+        criterion = nn.CrossEntropyLoss()
+
+        outputs = net(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        optimizer.zero_grad()
+
+        return loss
 
     for epoch in range(2):  # loop over the dataset multiple times
 

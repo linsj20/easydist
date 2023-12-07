@@ -84,6 +84,9 @@ class VarSPMDStrategy:
     def __str__(self) -> str:
         return f"VarSPMDStrategy({self.var_spmd_strategy.__str__()})"
 
+    def __len__(self) -> str:
+        return self.var_spmd_strategy.__len__()
+
     def __repr__(self) -> str:
         return self.__str__()
 
@@ -110,6 +113,9 @@ class VarSPMDStrategyGroup:
 
     def __getitem__(self, idx) -> VarSPMDStrategy:
         return self.var_spmd_strategy_group[idx]
+
+    def __len__(self) -> str:
+        return self.var_spmd_strategy_group.__len__()
 
     def __str__(self) -> str:
         return f"VarSPMDStrategyGroup({self.var_spmd_strategy_group.__str__()})"
@@ -336,8 +342,13 @@ class MetaNode:
 
     def _replicate_strategy(self):
         invars_strategy = VarSPMDStrategyGroup()
-        for _ in self.invars:
-            invars_strategy.append(VarSPMDStrategy(SPMD(SPMD.REPLICATE)))
+        # placeholder has not invars
+        if "placeholder" in self.op_name:
+            for _ in self.outvars:
+                invars_strategy.append(VarSPMDStrategy(SPMD(SPMD.REPLICATE)))
+        else:
+            for _ in self.invars:
+                invars_strategy.append(VarSPMDStrategy(SPMD(SPMD.REPLICATE)))
         outvars_strategy = VarSPMDStrategyGroup()
         for _ in self.outvars:
             outvars_strategy.append(VarSPMDStrategy(SPMD(SPMD.REPLICATE)))
@@ -895,18 +906,17 @@ class MetaGraph:
             if op.is_placeholder:
                 if op.unique_key() in opt_strategy:
                     strategy = opt_strategy[op.unique_key()]['strategy'].out_strtg_group[0]
-                    partial_strategy[op.outvars[0]] = strategy
+                    partial_strategy[op.outvars[0].name] = strategy
                 else:
                     logger.warning(f"{op.unique_key()} not found in opt_strategy. (maybe scalar tensor)")
 
         partial_strategy_list = []
 
         for var in self.input_list:
-            if var in partial_strategy:
-                partial_strategy_list.append(partial_strategy[var])
+            if var.name in partial_strategy:
+                partial_strategy_list.append(partial_strategy[var.name])
             else:
-                partial_strategy_list.append(
-                    [SPMD(SPMD.REPLICATE),
-                     SPMD(SPMD.REPLICATE)])
+                partial_strategy_list.append(VarSPMDStrategy(SPMD(SPMD.REPLICATE), SPMD(SPMD.REPLICATE)))
 
         return partial_strategy_list
+

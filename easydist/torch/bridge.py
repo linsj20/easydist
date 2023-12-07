@@ -12,19 +12,14 @@
 # limitations under the License.
 # ==============================================================================
 
-import os
 import torch
 from torch.fx.node import Node, _get_qualified_name
-import torch.distributed.distributed_c10d as c10d
-
-import torch.distributed._tensor as spmd
 from torch.distributed._tensor import distribute_tensor
 import torch.utils._pytree as pytree
 
-from easydist.metashard.combination import ReduceOp
-from easydist.metashard import metair
 from easydist.metashard.metair import MetaGraph, MetaNode, MetaVar
 from easydist.utils import rsetattr, rgetattr
+from easydist.torch.utils import to_torch_spmd
 import easydist.config as mdconfig
 
 from .passes.sharding import get_device_mesh
@@ -41,20 +36,6 @@ ABSTRACT_DTYPE = {
 }
 
 
-def to_torch_spmd(meta_spmd):
-    if meta_spmd.state == metair.SPMD.SHARD:
-        return spmd.Shard(dim=meta_spmd.args["dim"])
-    elif meta_spmd.state == metair.SPMD.PARTIAL:
-        mapping_ops = {
-            ReduceOp.SUM: c10d.ReduceOp.RedOpType.SUM,
-            ReduceOp.MAX: c10d.ReduceOp.RedOpType.MAX,
-            ReduceOp.MIN: c10d.ReduceOp.RedOpType.MIN,
-        }
-        return spmd.placement_types._Partial(reduce_op=mapping_ops[meta_spmd.args["ops"]])
-    elif meta_spmd.state == metair.SPMD.REPLICATE:
-        return spmd.Replicate()
-
-
 def materialize(x, device):
     if isinstance(x, torch.Tensor) and x.is_meta:
         if x.dtype == torch.bool:
@@ -64,43 +45,6 @@ def materialize(x, device):
         else:
             return torch.randint(high=8, size=x.size(), dtype=x.dtype, device=device)
     return x
-
-
-def shard_module(model, input_, input_strategy, device="cuda"):
-    mesh = get_device_mesh()
-
-    input_strategy = [[to_torch_spmd(i) for i in var_strategy] for var_strategy in input_strategy]
-
-    idx = 0
-    for name in dict(model.named_parameters()):
-
-        tensor_data = rgetattr(model, name).data
-        tensor_data = materialize(tensor_data, device=device)
-
-        rsetattr(
-            model, name,
-            torch.nn.parameter.Parameter(distribute_tensor(tensor_data, mesh,
-                                                           input_strategy[idx])))
-
-        with torch.no_grad():
-            rsetattr(model, name + ".grad", torch.empty_like(rgetattr(model, name).data))
-        idx += 1
-
-    for name in dict(model.named_buffers()):
-
-        tensor_data = rgetattr(model, name).data
-        tensor_data = materialize(tensor_data, device=device)
-
-        rsetattr(model, name, distribute_tensor(tensor_data, mesh, input_strategy[idx]))
-        idx += 1
-
-    shard_input = []
-    for tensor in input_:
-        tensor = materialize(tensor, device=device)
-        shard_input.append(distribute_tensor(tensor, mesh, input_strategy[idx]))
-        idx += 1
-
-    return shard_input
 
 
 def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding_info,
@@ -149,16 +93,13 @@ def torch2meta_graph(fx_module: torch.fx.GraphModule, state_tensor_num, sharding
             # 1.2. create MetaNode
             node_sharding_info = None
             if op_name in sharding_info:
-                def _gen_meta(arg):
-                    if isinstance(arg, Node):
-                        return torch.empty(meta_info[arg.name]["shape"],
-                                           dtype=meta_info[arg.name]["dtype"],
-                                           device="meta")
-                    else:
-                        # primitive data type: int, float, etc
-                        return arg
 
-                args_meta = pytree.tree_map(_gen_meta, node.args)
+                def _gen_meta(arg: Node):
+                    return torch.empty(meta_info[arg.name]["shape"],
+                                        dtype=meta_info[arg.name]["dtype"],
+                                        device="meta")
+
+                args_meta = pytree.tree_map_only(Node, _gen_meta, node.args)
                 args_meta = str(tuple(args_meta)) + ' | ' + str(node.kwargs)
                 if args_meta in sharding_info[op_name]:
                     node_sharding_info = sharding_info[op_name][args_meta]
