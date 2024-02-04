@@ -147,7 +147,7 @@ def comm_nodes_group(fx_module, node_list):
     '''
 
     if len(node_list) <= 1:
-        return
+        return False
     # group the node and add proper decouple node to both the graph and the schedule
     sche = [node for node in fx_module.graph.nodes]
     from_nodes = [node.all_input_nodes[0] for node in node_list]
@@ -172,14 +172,15 @@ def comm_nodes_group(fx_module, node_list):
 
     to_node = sche[min([sche.index(to_node) for to_node in to_nodes])]
 
-    with fx_module.graph.inserting_before(node_list[0]):
-        comm_args = list(node_list[0].args[1:])
+    with fx_module.graph.inserting_after(node_list[-1]):
+        comm_args = list(node_list[-1].args[1:])
         new_from_node = fx_module.graph.call_function(comm_couple, args=tuple(from_nodes))
         new_from_node.meta = create_meta_from_node(new_from_node)
         new_from_node.ed_info = EDInfo()
         new_from_node.ed_info.node_type = EDNodeType.COMPUTATION
 
-        comm_op_name = _get_qualified_name(node_list[0].target)
+    with fx_module.graph.inserting_after(new_from_node):
+        comm_op_name = _get_qualified_name(node_list[-1].target)
         new_comm_node = fx_module.graph.call_function(eval(comm_op_name),
                                                       args=tuple([new_from_node] + comm_args))
         new_comm_node.meta = create_meta_from_node(new_comm_node)
@@ -203,7 +204,7 @@ def comm_nodes_group(fx_module, node_list):
     for idx, (comm_node, to_node) in enumerate(zip(node_list, to_nodes)):
         with fx_module.graph.inserting_before(to_node):
             retrive_node = fx_module.graph.call_function(operator.getitem, args=(new_to_node, idx))
-        to_node.replace_input_with(comm_node, retrive_node)
+        to_node.replace_input_with(comm_node.ed_info.comm_meta['end_node'], retrive_node)
         retrive_node.meta = create_meta_from_node(retrive_node)
         retrive_node.ed_info = EDInfo()
         retrive_node.ed_info.node_type = EDNodeType.COMPUTATION
@@ -211,12 +212,20 @@ def comm_nodes_group(fx_module, node_list):
     fx_module.graph.eliminate_dead_code()
     fx_module.recompile()
 
+    return True
+
+group_ops = ['all_reduce_start']
+def is_to_group(n):
+    n_op_name = _get_qualified_name(n.target)
+    for op_name in group_ops:
+        if n_op_name.__contains__(op_name):
+            return True
+    return False
+
 
 def groupable(n1, n2):
     n1_op_name = _get_qualified_name(n1.target)
     n2_op_name = _get_qualified_name(n2.target)
-    if not n1_op_name.__contains__('reduce'):
-        return False
     return n1_op_name == n2_op_name and n1.args[1:] == n2.args[1:]
 
 
@@ -235,22 +244,33 @@ def comm_group(fx_module, cap_limit, rg_limit):
     Returns:
     A grouped fx_module
     '''
+    if torch.distributed.get_rank() == 0:
+        logger.info("Perform communication fusion...")
+
     sche = [node for node in fx_module.graph.nodes]
-    idx = len(sche) - 1
+    #idx = len(sche) - 1
+    idx = 0
+    num_nodes = len(sche)
     cur_cap = 0
     cur_range = 0
     cur_comm_list = []
     comm_list_dep = []
     retrive_node = None
-    while idx >= 0:
+    #while idx >= 0:
+    fused_comm = 0
+    output_comm = 0
+    while idx < num_nodes or retrive_node is not None:
         cur_range += 1
 
-        if (not sche[idx].ed_info.is_communication() and sche[idx] in comm_list_dep) \
+        #if (not sche[idx].ed_info.is_communication() and sche[idx] in comm_list_dep) \
+        if sche[idx] in comm_list_dep \
             or cur_range > rg_limit \
             or cur_cap > cap_limit:
 
-            cur_comm_list.reverse()
-            comm_nodes_group(fx_module, cur_comm_list)
+            #cur_comm_list.reverse()
+            if comm_nodes_group(fx_module, cur_comm_list):
+                fused_comm += len(cur_comm_list)
+                output_comm += 1
             sche = [node for node in fx_module.graph.nodes]
 
             cur_cap = 0
@@ -263,25 +283,27 @@ def comm_group(fx_module, cap_limit, rg_limit):
                 continue
 
         if not sche[idx].ed_info.is_communication():
-            idx -= 1
+            idx += 1
             continue
 
         node = sche[idx]
         comm_vol = node.ed_info.comm_meta['comm_vol']
 
-        if comm_vol < cap_limit:
+        if comm_vol < cap_limit and is_to_group(node):
             if len(cur_comm_list) == 0 or \
                 groupable(node, cur_comm_list[0]):
                 cur_cap += comm_vol
                 del sche[idx]
                 cur_comm_list.append(node)
-                comm_list_dep.append(node.all_input_nodes[0])
+                comm_list_dep.append(node.ed_info.comm_meta['to_node'])
             elif retrive_node is None:
                 retrive_node = node
 
-        idx -= 1
+        idx += 1
     fx_module.graph.eliminate_dead_code()
     fx_module.recompile()
+    if torch.distributed.get_rank() == 0:
+        logger.info(f"Fuse {fused_comm} comms into {output_comm} comms.")
     return fx_module
 
 
@@ -306,6 +328,14 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
     if mdconfig.log_level <= logging.DEBUG:
         fx_module.print_readable()
 
+    '''
+    if torch.distributed.get_rank() == 0:
+        fx_module.print_readable()
+        print('000')
+        for n in fx_module.graph.nodes:
+            print(n.ed_info)
+    '''
+
     # collect necessary communication node info, save at comm_meta in node.ed_info
     for node in fx_module.graph.nodes:
         if node.ed_info.is_communication():
@@ -319,11 +349,15 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
             }
         elif node.ed_info.is_computation():
             for pre in node.all_input_nodes:
-                if pre.ed_info.is_communication():
-                    pre.ed_info.comm_meta['to_node'] = node
-
-    if grouping:
-        fx_module = comm_group(fx_module, 1024 * 1024, 10000)
+                #if pre.ed_info.is_communication():
+                if hasattr(pre, 'ed_info') and\
+                    pre.ed_info.is_communication():
+                    pre.ed_info.comm_meta['end_node'] = node
+                elif len(pre.all_input_nodes) == 1:
+                    prepre = pre.all_input_nodes[0]
+                    if hasattr(prepre, 'ed_info') and\
+                        prepre.ed_info.is_communication():
+                        prepre.ed_info.comm_meta['to_node'] = node
 
     # comm_map: node just computed -> commnications followed
     comm_map = {}
@@ -342,6 +376,11 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
 
         _link_nodes(fx_module, sche)
 
+        grouping = True
+        if grouping:
+            fx_module = comm_group(fx_module, 1024 * 1024 * 1024, 10000)
+
+        sche = [node for node in fx_module.graph.nodes]
         for idx, node in enumerate(sche):
             if not node.ed_info.is_communication() and \
                 idx + 1 < len(sche) and \
@@ -353,6 +392,13 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
                     else:
                         break
                 assert (len(comm_map[node]) > 0)
+
+    #if torch.distributed.get_rank() == 0:
+    #    fx_module.print_readable()
+    #    print('000')
+    #    for n in fx_module.graph.nodes:
+    #        print(n.ed_info)
+
 
     def grouped_comm(input_tensors: list, comm_func: list, comm_args: list):
         res = []
