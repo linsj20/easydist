@@ -189,7 +189,7 @@ def comm_nodes_group(fx_module, node_list):
         new_to_node = fx_module.graph.call_function(comm_decouple,
                                                     args=(new_comm_node, tuple(retrive_points),
                                                           tuple(retrive_shapes)))
-        new_to_node.meta = create_meta_from_node(new_to_node)
+        #new_to_node.meta = create_meta_from_node(new_to_node)
         new_to_node.ed_info = EDInfo()
         new_to_node.ed_info.node_type = EDNodeType.COMPUTATION
 
@@ -205,7 +205,7 @@ def comm_nodes_group(fx_module, node_list):
         with fx_module.graph.inserting_before(to_node):
             retrive_node = fx_module.graph.call_function(operator.getitem, args=(new_to_node, idx))
         to_node.replace_input_with(comm_node.ed_info.comm_meta['end_node'], retrive_node)
-        retrive_node.meta = create_meta_from_node(retrive_node)
+        #retrive_node.meta = create_meta_from_node(retrive_node)
         retrive_node.ed_info = EDInfo()
         retrive_node.ed_info.node_type = EDNodeType.COMPUTATION
 
@@ -259,9 +259,12 @@ def comm_group(fx_module, cap_limit, rg_limit):
     #while idx >= 0:
     fused_comm = 0
     output_comm = 0
-    while idx < num_nodes or retrive_node is not None:
+    while idx < len(sche) or retrive_node is not None:
         cur_range += 1
 
+        if idx == len(sche) and retrive_node is not None:
+            idx = sche.index(retrive_node)
+            retrive_node = None
         #if (not sche[idx].ed_info.is_communication() and sche[idx] in comm_list_dep) \
         if sche[idx] in comm_list_dep \
             or cur_range > rg_limit \
@@ -328,13 +331,13 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
     if mdconfig.log_level <= logging.DEBUG:
         fx_module.print_readable()
 
-    '''
-    if torch.distributed.get_rank() == 0:
-        fx_module.print_readable()
-        print('000')
-        for n in fx_module.graph.nodes:
-            print(n.ed_info)
-    '''
+    # if torch.distributed.get_rank() == 0:
+    #     fx_module.print_readable()
+    #     print('000')
+    #     for n in fx_module.graph.nodes:
+    #         print('!')
+    #         print(n.name)
+    #         print(n.ed_info)
 
     # collect necessary communication node info, save at comm_meta in node.ed_info
     for node in fx_module.graph.nodes:
@@ -347,17 +350,27 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
                 'comm_vol': reduce(lambda x, y: x * y, comm_shape, 1) * 4,  #Bytes
                 'comm_shape': comm_shape
             }
-        elif node.ed_info.is_computation():
+        else:
             for pre in node.all_input_nodes:
-                #if pre.ed_info.is_communication():
                 if hasattr(pre, 'ed_info') and\
                     pre.ed_info.is_communication():
                     pre.ed_info.comm_meta['end_node'] = node
-                elif len(pre.all_input_nodes) == 1:
-                    prepre = pre.all_input_nodes[0]
-                    if hasattr(prepre, 'ed_info') and\
-                        prepre.ed_info.is_communication():
-                        prepre.ed_info.comm_meta['to_node'] = node
+                elif len(pre.all_input_nodes) > 0:
+                    for prepre in pre.all_input_nodes:
+                        if hasattr(prepre, 'ed_info') and\
+                            prepre.ed_info.is_communication():
+                            prepre.ed_info.comm_meta['to_node'] = node
+
+
+    # if torch.distributed.get_rank() == 0:
+    #     for node in fx_module.graph.nodes:
+    #         if node.ed_info.is_communication():
+    #             print(node.ed_info.comm_meta['to_node'])
+    #     print('000')
+    #     fx_module.print_readable()
+    #     print('000')
+    #     for n in fx_module.graph.nodes:
+    #         print(n.ed_info)
 
     # comm_map: node just computed -> commnications followed
     comm_map = {}
