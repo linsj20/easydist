@@ -172,7 +172,8 @@ def comm_nodes_group(fx_module, node_list):
 
     to_node = sche[min([sche.index(to_node) for to_node in to_nodes])]
 
-    with fx_module.graph.inserting_after(node_list[-1]):
+    #with fx_module.graph.inserting_after(node_list[-1]):
+    with fx_module.graph.inserting_before(node_list[0]):
         comm_args = list(node_list[-1].args[1:])
         new_from_node = fx_module.graph.call_function(comm_couple, args=tuple(from_nodes))
         new_from_node.meta = create_meta_from_node(new_from_node)
@@ -227,6 +228,82 @@ def groupable(n1, n2):
     n1_op_name = _get_qualified_name(n1.target)
     n2_op_name = _get_qualified_name(n2.target)
     return n1_op_name == n2_op_name and n1.args[1:] == n2.args[1:]
+
+
+def comm_group_(fx_module):
+    if torch.distributed.get_rank() == 0:
+        logger.info("Perform communication fusion...")
+    sche = [node for node in fx_module.graph.nodes]
+    nodes_to_be_group = []
+    lbound = rbound = -1
+    retrive_node = None
+
+    # assuming one input for each light node
+    light_node_types = ['_operator.getitem', 'torch.ops.aten.view.default', 'torch.ops.aten.t.default']
+    def if_heavy_computation_of_comm_node_late_than_lbound(sche, node, lbound):
+        comp_node = node.all_input_nodes[0]
+        node_name = _get_qualified_name(comp_node.target)
+        light_node_list = []
+        while node_name in light_node_types:
+            if lbound > sche.index(comp_node):
+                break
+            light_node_list.append(comp_node)
+            comp_node = comp_node.all_input_nodes[0]
+            node_name = _get_qualified_name(comp_node.target)
+
+        comp_idx = sche.index(comp_node)
+        if lbound < comp_idx:
+            return True
+        
+        if len(light_node_list) > 0:
+            
+            light_node_list.reverse()
+
+            for light_node in light_node_list:
+                sche.remove(light_node)
+
+            for idx, light_node in enumerate(light_node_list):
+                sche.insert(comp_idx + 1 + idx, light_node)
+        
+        return False
+
+    fused_comm = 0
+    output_comm = 0
+    idx = 0
+    while idx < len(sche):
+        node = sche[idx]
+        if node.ed_info.is_communication():
+            if is_to_group(node):
+                if len(nodes_to_be_group) == 0:
+                    nodes_to_be_group.append(node)
+                    lbound = idx
+                    rbound = sche.index(node.ed_info.comm_meta['to_node'])
+                else:
+                    if groupable(node, nodes_to_be_group[0]):
+                        if idx > rbound or if_heavy_computation_of_comm_node_late_than_lbound(sche, node, lbound):
+                            _link_nodes(fx_module, sche)
+                            if comm_nodes_group(fx_module, nodes_to_be_group):
+                                fused_comm += len(nodes_to_be_group)
+                                output_comm += 1
+                                sche = [node for node in fx_module.graph.nodes]
+                            nodes_to_be_group = []
+                            idx = sche.index(retrive_node) if retrive_node is not None else sche.index(node)
+                            retrive_node = None
+                            continue
+                        else:
+                            nodes_to_be_group.append(node)
+                            rbound = min(rbound, sche.index(node.ed_info.comm_meta['to_node']))
+                    elif retrive_node is None:
+                        retrive_node = node
+        idx += 1
+    if len(nodes_to_be_group) > 1:
+        _link_nodes(fx_module, sche)
+        if comm_nodes_group(fx_module, nodes_to_be_group):
+            fused_comm += len(nodes_to_be_group)
+            output_comm += 1
+    if torch.distributed.get_rank() == 0:
+        logger.info(f"Fuse {fused_comm} comms into {output_comm} comms.")
+    return fx_module
 
 
 def comm_group(fx_module, cap_limit, rg_limit):
@@ -331,16 +408,11 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
     if mdconfig.log_level <= logging.DEBUG:
         fx_module.print_readable()
 
-    # if torch.distributed.get_rank() == 0:
-    #     fx_module.print_readable()
-    #     print('000')
-    #     for n in fx_module.graph.nodes:
-    #         print('!')
-    #         print(n.name)
-    #         print(n.ed_info)
-
+    #exit(1)
     # collect necessary communication node info, save at comm_meta in node.ed_info
     for node in fx_module.graph.nodes:
+        if node.name.__contains__('fused_adam'):
+            node.ed_info.node_type = EDNodeType.COMPUTATION
         if node.ed_info.is_communication():
             assert len(node.all_input_nodes) == 1
             from_node = node.all_input_nodes[0]
@@ -389,9 +461,26 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
 
         _link_nodes(fx_module, sche)
 
+        '''
+        if torch.distributed.get_rank() == 0:
+            print('origin')
+            fx_module.print_readable()
+            for n in fx_module.graph.nodes:
+                print('!')
+                print(n.name)
+                print(n.ed_info)
+        '''
+
         grouping = True
         if grouping:
-            fx_module = comm_group(fx_module, 1024 * 1024 * 1024, 10000)
+            #fx_module = comm_group(fx_module, 3 * 1024 * 1024 * 1024, 10000)
+            fx_module = comm_group_(fx_module)
+
+        '''
+        if torch.distributed.get_rank() == 0:
+            print('transformed')
+            fx_module.print_readable()
+        '''
 
         sche = [node for node in fx_module.graph.nodes]
         for idx, node in enumerate(sche):
@@ -406,9 +495,9 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
                         break
                 assert (len(comm_map[node]) > 0)
 
-    #if torch.distributed.get_rank() == 0:
-    #    fx_module.print_readable()
-    #    print('000')
+    # if torch.distributed.get_rank() == 0:
+    #     fx_module.print_readable()
+    #     print('000')
     #    for n in fx_module.graph.nodes:
     #        print(n.ed_info)
 
@@ -446,7 +535,6 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
     fx_module.recompile()
 
     if torch.distributed.get_rank() == 0:
-        # fx_module.print_readable()
         logger.info("Communication Optimization: Done!")
     return fx_module
 
