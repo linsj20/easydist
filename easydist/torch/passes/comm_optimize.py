@@ -99,7 +99,7 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, mem_constrain: bool):
                 for output_shape in output_shapes:
                     if output_shape.get('shape') is not None:
                         mem_req += int(
-                            reduce(lambda x, y: x * y, output_shape['shape'], 1) * 4 / 1024)
+                            reduce(lambda x, y: x * y, output_shape['shape'], 1) / 1024) # unit: dtype
         if mem_constrain is True:
             resource.append(('mem', mem_req))
 
@@ -141,6 +141,13 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, mem_constrain: bool):
     return sche
 
 
+group_ops = [
+    'easydist.torch.passes.sharding.all_reduce_start',
+    'easydist.torch.passes.sharding.all_gather_start',
+    #'easydist.torch.passes.sharding.reduce_scatter_start'
+]
+
+
 def comm_nodes_group(fx_module, node_list):
     '''
     Group the nodes in node_list
@@ -153,43 +160,81 @@ def comm_nodes_group(fx_module, node_list):
     from_nodes = [node.all_input_nodes[0] for node in node_list]
     to_nodes = [node.ed_info.comm_meta['to_node'] for node in node_list]
     total_size = 0
-    retrive_points = []
-    retrive_shapes = []
-    for node in node_list:
-        comm_vol = node.ed_info.comm_meta['comm_vol']
-        comm_shape = node.ed_info.comm_meta['comm_shape']
-        retrive_points.append(int(comm_vol / 4))
-        retrive_shapes.append(comm_shape)
-        total_size += comm_vol
 
-    def comm_couple(*tensor_list):
-        flattened_tensor_list = [t.flatten() for t in tensor_list]
-        return torch.cat(tuple(flattened_tensor_list))
+    comm_op = _get_qualified_name(node_list[0].target)
+    comm_args = list(node_list[0].args[1:])
+    if comm_op == 'easydist.torch.passes.sharding.all_reduce_start':
+        retrive_points = []
+        retrive_shapes = []
+        for node in node_list:
+            comm_vol = node.ed_info.comm_meta['comm_vol']
+            comm_shape = node.ed_info.comm_meta['comm_shape']
+            retrive_points.append(comm_vol)
+            retrive_shapes.append(comm_shape)
+            total_size += comm_vol
+        decouple_args = [tuple(retrive_points), tuple(retrive_shapes)]
 
-    def comm_decouple(tensor, retrive_points, retrive_shapes):
-        tensor_list = torch.split(tensor, retrive_points)
-        return [tensor.reshape(shape) for tensor, shape in zip(tensor_list, retrive_shapes)]
+        def comm_couple(*tensor_list):
+            flattened_tensor_list = [t.flatten() for t in tensor_list]
+            return torch.cat(tuple(flattened_tensor_list))
+
+        def comm_decouple(tensor, retrive_points, retrive_shapes):
+            tensor_list = torch.split(tensor, retrive_points)
+            return [tensor.reshape(shape) for tensor, shape in zip(tensor_list, retrive_shapes)]
+    elif comm_op == 'easydist.torch.passes.sharding.all_gather_start':
+        retrive_points = []
+        retrive_shapes = []
+        for node in node_list:
+            comm_vol = node.ed_info.comm_meta['comm_vol']
+            comm_shape = node.ed_info.comm_meta['comm_shape']
+            retrive_points.append(comm_vol)
+            retrive_shapes.append(comm_shape)
+            total_size += comm_vol
+
+        # force to gather on dim 0
+        org_dim = comm_args[0]
+        comm_args[0] = 0
+
+        decouple_args = [total_size, org_dim, tuple(retrive_points), tuple(retrive_shapes)]
+
+        def comm_couple(*tensor_list):
+            flattened_tensor_list = [t.flatten() for t in tensor_list]
+            return torch.cat(tuple(flattened_tensor_list))
+
+        def comm_decouple(tensor, chunk_size, gather_dim, retrive_points, retrive_shapes):
+            chunk_list = torch.split(tensor, chunk_size)
+            tensor1d_lists = [torch.split(chunk, retrive_points) for chunk in chunk_list]
+            tensor_lists = [[tensor1d.reshape(shape) for tensor1d, shape in 
+                            zip(tensor1d_list, retrive_shapes)] for tensor1d_list in tensor1d_lists]
+            return [torch.cat([tensor_list[i] for tensor_list in tensor_lists], gather_dim) for i in range(len(tensor_lists[0]))]
+
+    elif comm_op == 'easydist.torch.passes.sharding.reduce_scatter_start':
+        def comm_couple(*tensor_list):
+            pass
+        def comm_decouple(tensor, retrive_points, retrive_shapes):
+            pass
+    else:
+        raise RuntimeError('Fusion: unrecognized communication type')
 
     to_node = sche[min([sche.index(to_node) for to_node in to_nodes])]
 
     #with fx_module.graph.inserting_after(node_list[-1]):
     with fx_module.graph.inserting_before(node_list[0]):
-        comm_args = list(node_list[-1].args[1:])
         new_from_node = fx_module.graph.call_function(comm_couple, args=tuple(from_nodes))
         new_from_node.meta = create_meta_from_node(new_from_node)
         new_from_node.ed_info = EDInfo()
         new_from_node.ed_info.node_type = EDNodeType.COMPUTATION
 
     with fx_module.graph.inserting_after(new_from_node):
-        comm_op_name = _get_qualified_name(node_list[-1].target)
-        new_comm_node = fx_module.graph.call_function(eval(comm_op_name),
+        new_comm_node = fx_module.graph.call_function(eval(comm_op),
                                                       args=tuple([new_from_node] + comm_args))
         new_comm_node.meta = create_meta_from_node(new_comm_node)
 
     with fx_module.graph.inserting_before(to_node):
         new_to_node = fx_module.graph.call_function(comm_decouple,
-                                                    args=(new_comm_node, tuple(retrive_points),
-                                                          tuple(retrive_shapes)))
+                                                    args=tuple([new_comm_node] + decouple_args))
+                                                    #args=(new_comm_node, tuple(retrive_points),
+                                                    #      tuple(retrive_shapes)))
         #new_to_node.meta = create_meta_from_node(new_to_node)
         new_to_node.ed_info = EDInfo()
         new_to_node.ed_info.node_type = EDNodeType.COMPUTATION
@@ -215,12 +260,11 @@ def comm_nodes_group(fx_module, node_list):
 
     return True
 
-group_ops = ['all_reduce_start']
+
 def is_to_group(n):
     n_op_name = _get_qualified_name(n.target)
-    for op_name in group_ops:
-        if n_op_name.__contains__(op_name):
-            return True
+    if n_op_name in group_ops:
+        return True
     return False
 
 
@@ -239,17 +283,18 @@ def comm_group_(fx_module):
     retrive_node = None
 
     # assuming one input for each light node
-    light_node_types = ['_operator.getitem', 'torch.ops.aten.view.default', 'torch.ops.aten.t.default']
+    light_node_types = ['__arg__', '_operator.getitem', 'torch.ops.aten.view.default', 'torch.ops.aten.t.default']
     def if_heavy_computation_of_comm_node_late_than_lbound(sche, node, lbound):
         comp_node = node.all_input_nodes[0]
-        node_name = _get_qualified_name(comp_node.target)
+        node_name = '__arg__' if comp_node.name.__contains__('arg') else _get_qualified_name(comp_node.target)
         light_node_list = []
         while node_name in light_node_types:
             if lbound > sche.index(comp_node):
                 break
             light_node_list.append(comp_node)
             comp_node = comp_node.all_input_nodes[0]
-            node_name = _get_qualified_name(comp_node.target)
+            node_name = '__arg__' if comp_node.name.__contains__('arg') else _get_qualified_name(comp_node.target)
+            #node_name = _get_qualified_name(comp_node.target)
 
         comp_idx = sche.index(comp_node)
         if lbound < comp_idx:
@@ -419,7 +464,7 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
             comm_shape = from_node.meta['val'].shape
             # TODO support mixed precision
             node.ed_info.comm_meta = {
-                'comm_vol': reduce(lambda x, y: x * y, comm_shape, 1) * 4,  #Bytes
+                'comm_vol': reduce(lambda x, y: x * y, comm_shape, 1),  #unit: dtype
                 'comm_shape': comm_shape
             }
         else:
