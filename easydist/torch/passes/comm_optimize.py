@@ -144,7 +144,7 @@ def rcpsp_schedule(fx_module: torch.fx.GraphModule, mem_constrain: bool):
 group_ops = [
     'easydist.torch.passes.sharding.all_reduce_start',
     'easydist.torch.passes.sharding.all_gather_start',
-    #'easydist.torch.passes.sharding.reduce_scatter_start'
+    'easydist.torch.passes.sharding.reduce_scatter_start'
 ]
 
 
@@ -206,13 +206,38 @@ def comm_nodes_group(fx_module, node_list):
             tensor1d_lists = [torch.split(chunk, retrive_points) for chunk in chunk_list]
             tensor_lists = [[tensor1d.reshape(shape) for tensor1d, shape in 
                             zip(tensor1d_list, retrive_shapes)] for tensor1d_list in tensor1d_lists]
-            return [torch.cat([tensor_list[i] for tensor_list in tensor_lists], gather_dim) for i in range(len(tensor_lists[0]))]
+            return [torch.cat([tensor_list[i] for tensor_list in 
+                               tensor_lists], gather_dim) for i in range(len(tensor_lists[0]))]
 
     elif comm_op == 'easydist.torch.passes.sharding.reduce_scatter_start':
+        # transpose + view
+        # TODO how to pass pp process group?
+        split_size = torch.distributed.get_world_size()
+        scatter_dim = comm_args[1]
+        
+        retrive_points = []
+        retrive_shapes = []
+        for node in node_list:
+            comm_vol = node.ed_info.comm_meta['comm_vol']
+            comm_shape = list(node.ed_info.comm_meta['comm_shape'])
+            retrive_points.append(int(comm_vol / split_size))
+            comm_shape[scatter_dim] = int(comm_shape[scatter_dim] / split_size)
+            retrive_shapes.append(torch.Size(comm_shape))
+
+        decouple_args = [tuple(retrive_points), tuple(retrive_shapes)]
+
         def comm_couple(*tensor_list):
-            pass
+            chunked_tensor = [t.chunk(split_size, dim=scatter_dim) for t in tensor_list]
+            flattened_tensor_lists = [[t.flatten() for t in tensor_list] for 
+                                      tensor_list in chunked_tensor]
+            new_chunked_tensor = [torch.cat([flattened_tensor_list[i] for flattened_tensor_list in
+                                              flattened_tensor_lists]) for i in 
+                                              range(len(flattened_tensor_lists[0]))]
+            return torch.cat(new_chunked_tensor)
+
         def comm_decouple(tensor, retrive_points, retrive_shapes):
-            pass
+            tensor_list = torch.split(tensor, retrive_points)
+            return [tensor.reshape(shape) for tensor, shape in zip(tensor_list, retrive_shapes)]
     else:
         raise RuntimeError('Fusion: unrecognized communication type')
 
@@ -340,12 +365,19 @@ def comm_group_(fx_module):
                             rbound = min(rbound, sche.index(node.ed_info.comm_meta['to_node']))
                     elif retrive_node is None:
                         retrive_node = node
+
+        if idx + 1 == len(sche) and len(nodes_to_be_group) > 1:
+            _link_nodes(fx_module, sche)
+            if comm_nodes_group(fx_module, nodes_to_be_group):
+                fused_comm += len(nodes_to_be_group)
+                output_comm += 1
+                sche = [node for node in fx_module.graph.nodes]
+            nodes_to_be_group = []
+            if retrive_node is not None:
+                idx = sche.index(retrive_node) 
+                retrive_node = None
+                continue
         idx += 1
-    if len(nodes_to_be_group) > 1:
-        _link_nodes(fx_module, sche)
-        if comm_nodes_group(fx_module, nodes_to_be_group):
-            fused_comm += len(nodes_to_be_group)
-            output_comm += 1
     if torch.distributed.get_rank() == 0:
         logger.info(f"Fuse {fused_comm} comms into {output_comm} comms.")
     return fx_module
