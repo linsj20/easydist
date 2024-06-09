@@ -28,6 +28,7 @@ from torch.utils._mode_utils import no_dispatch
 import torch.utils._pytree as pytree
 from torch.distributed._tensor.ops.view_ops import compute_local_shape
 from torch.fx.passes.shape_prop import _extract_tensor_metadata
+from torch._guards import detect_fake_mode
 
 from easydist.metashard.combination import ReduceOp
 from easydist.metashard import metair
@@ -49,8 +50,11 @@ def to_meta(node_output):
 
 def create_meta_from_node(node):
     fake_args = pytree.tree_map_only(torch.fx.Node, lambda n: n.meta['val'], node.args)
+    fake_mode = detect_fake_mode(fake_args)
+    if fake_mode is not None:
+        fake_args = pytree.tree_map_only(torch.Tensor, lambda n: fake_mode.from_tensor(n), fake_args)
     fake_val = node.target(*fake_args, **node.kwargs)
-    if isinstance(fake_val, list):
+    if isinstance(fake_val, list) or isinstance(fake_val, tuple):
         return {'val': fake_val}
     return {'val': fake_val, 'tensor_meta': _extract_tensor_metadata(fake_val)}
 
@@ -83,7 +87,8 @@ class EDInfo:
     spmd_annotation: Any = None
     strategy: NodeSPMDStrategy = None
     runtime_ms: float = 0.0
-    normalized_int_runtime_ms = 1
+    tiled_runtime_ms: Dict = None
+    normalized_int_runtime_ms: int = 1
     comm_meta = None  # {comm_vol, comm_shape}
 
     def is_communication(self):
@@ -98,12 +103,12 @@ class EDInfo:
         if self.strategy is None:
             return shared_meta
 
-        device_mesh = get_device_mesh()
+        spmd_mesh = get_device_mesh('spmd')
 
         if isinstance(shared_meta['val'], torch.Tensor):
             global_out_shape = shared_meta['val'].shape
             shard_out = [to_torch_spmd(i) for i in self.strategy.get_outvar_strtg(0)]
-            local_out_shape = compute_local_shape(list(global_out_shape), device_mesh, shard_out)
+            local_out_shape = compute_local_shape(list(global_out_shape), spmd_mesh, shard_out)
             shared_meta['val'] = torch.ops.aten.new_empty.default(shared_meta['val'],
                                                                   local_out_shape)
             if 'tensor_meta' in shared_meta:
@@ -116,7 +121,7 @@ class EDInfo:
                     continue
                 global_out_shape = shared_meta['val'][idx].shape
                 shard_out = [to_torch_spmd(i) for i in self.strategy.get_outvar_strtg(idx)]
-                local_out_shape = compute_local_shape(list(global_out_shape), device_mesh,
+                local_out_shape = compute_local_shape(list(global_out_shape), spmd_mesh,
                                                       shard_out)
                 shared_meta['val'][idx] = torch.ops.aten.new_empty.default(
                     shared_meta['val'][idx], local_out_shape)
@@ -180,12 +185,20 @@ def _enable_compile():
     def f_true():
         return True
 
-    orig_is_compiling_code = torch._utils.is_compiling.__code__
-    torch._utils.is_compiling.__code__ = f_true.__code__
+    enabled_funcs = [
+        torch._utils.is_compiling,
+        torch._dynamo.is_compiling,
+    ]
+
+    orig_func_codes = [f.__code__ for f in enabled_funcs]
+    for f in enabled_funcs:
+        f.__code__ = f_true.__code__
+
     try:
         yield
     finally:
-        torch._utils.is_compiling.__code__ = orig_is_compiling_code
+        for f, orig_code in zip(enabled_funcs, orig_func_codes):
+            f.__code__ = orig_code
 
 
 def get_input_signature(*args, **kwargs):
@@ -200,3 +213,25 @@ def get_dtensor_spec(mesh, placements, shape=None, ndim=None):
     if "shape" in list(DTensorSpec.__dataclass_fields__.keys()):
         return DTensorSpec(mesh=mesh, placements=placements, shape=shape, ndim=ndim)
     return DTensorSpec(mesh=mesh, placements=tuple(placements))
+
+def extract_tensor_meta_info(tensor: torch.Tensor):
+    metadata = torch._utils.get_tensor_metadata(tensor)
+    meta_info = (
+        f"  metadata: {metadata}\n"
+        f"  size: {tensor.size()}\n"
+        f"  dtype: {tensor.dtype}\n"
+        f"  dev: {tensor.device}\n"
+        f"  requires grad: {tensor.requires_grad}\n"
+        f"  is_cuda: {tensor.is_cuda}\n"
+        f"  numel: {tensor.numel()}\n"
+        f"  grad: {tensor.grad}\n"
+        f"  storage offset: {tensor.storage_offset()}\n"
+        f"  stride: {tensor.stride()}\n"
+        f"  is_leaf: {tensor.is_leaf}\n"
+        f"  is_contiguous: {tensor.is_contiguous()}\n"
+        f"  is_sparse: {tensor.is_sparse}\n"
+        f"  layout: {tensor.layout}\n"
+    )
+
+    return meta_info
+

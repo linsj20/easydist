@@ -20,7 +20,7 @@ from pathlib import Path
 def _get_env_or_raise(env_var: str) -> str:
     env_val = os.environ.get(env_var, None)
     if not env_val:
-        raise ValueError("environment variable {env_var} expected, but not set")
+        raise ValueError(f"environment variable {env_var} expected, but not set")
     else:
         return env_val
 
@@ -48,6 +48,8 @@ easydist_dir = os.path.join(Path.home(), ".easydist")
 prof_db_path = os.path.join(easydist_dir, "perf.db")
 dump_prof_db = False
 
+dump_fx_graph = os.environ.get("DUMP_FX_GRAPH", "False").upper() in ["1", "TRUE"]
+
 # MetaSPMD Annotation
 
 use_hint = os.environ.get("EASYDIST_USE_HINT") == "1"
@@ -65,21 +67,41 @@ coarsen_level = int(os.environ.get("COARSEN_LEVEL", "0"))
 
 # Master address and port
 master_addr = os.environ.get("MASTER_ADDR", "localhost")
-master_port = int(_get_env_or_raise("MASTER_PORT"))
+master_port = int(os.environ.get("MASTER_PORT", 12888))
 
 # PyTorch
 
 # Tile communication
 enable_tile_comm = False
+critical_context_length = 100
+tile_context_length = 15
 nvlink_processor_usage = 0.15
 
 # Scheduling communication
-comm_optimization = False
+comm_optimization = True
 # 'general', 'odd_even'
-rcpsp_method = 'odd_even'
+rcpsp_method = 'general'
 rcpsp_iter_round = 1 # odd_even rounds
 override_dtensor_rule = False
 
 # runtime
-
 use_contiguous_buffer = False
+
+# memory optimization
+enable_memory_opt = os.environ.get("ENABLE_MEMORY_OPT", "False").upper() in ["1", "TRUE"]
+
+# ignore memory reuse
+ignore_memory_reuse = os.environ.get("IGNORE_MEMORY_REUSE", "False").upper() in ["1", "TRUE"]
+
+# reschedule ops
+enable_reschedule = os.environ.get("ENABLE_RESCHEDULE", "False").upper() in ["1", "TRUE"]
+
+# memory usage optimization by solver
+mem_opt_by_solver = os.environ.get("MEM_OPT_BY_SOLVER", "False").upper() in ["1", "TRUE"]
+
+# dump memory usage graph
+dump_mem_usage_graph = os.environ.get("DUMP_MEM_USAGE_GRAPH", "False").upper() in ["1", "TRUE"]
+
+# runtime trace
+enable_runtime_trace = os.environ.get("ENABLE_RUNTIME_TRACE", "False").upper() in ["1", "TRUE"]
+

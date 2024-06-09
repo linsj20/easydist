@@ -19,14 +19,14 @@ from typing import List
 import torch
 import torch.utils._pytree as pytree
 from torch.distributed._tensor import DTensor, Replicate
-from torch.distributed._tensor import mesh_resources
 from torch.distributed._functional_collectives import _expand_group
 from torch.fx.node import Node, _get_qualified_name, map_arg
 from torch.distributed._tensor.ops.view_ops import (view_groups, normalize_sizes, expand,
                                                     propagate_shape_and_sharding,
                                                     compute_local_shape)
 
-from easydist.torch.device_mesh import device_mesh_rank, get_device_mesh
+from easydist.torch.device_mesh import get_device_mesh
+from easydist.torch.experimental.pp.split_utils import ANNOTATION_OPS
 from easydist.torch.utils import to_torch_spmd, EDInfo, EDNodeType, create_meta_from_node
 from easydist.utils.testing import MockDeviceMesh
 from easydist.metashard.metair import VarSPMDStrategy, SPMD, VarSPMDStrategyGroup, NodeSPMDStrategy
@@ -89,7 +89,7 @@ def all_gather_end(self: torch.Tensor, gather_dim: int, group: List[int], tag: s
 
 
 def scatter_wrapper(tensor, num_chunks, dim, indice):
-    return torch.ops.aten.chunk(tensor, num_chunks, dim)[indice]
+    return torch.ops.aten.chunk(tensor, num_chunks, dim)[indice].contiguous()
 
 
 def copy_wrapper(self, other):
@@ -150,9 +150,9 @@ def materialize(x, device):
 
 def redist_tensor_func(input_tensor, specs):
     if isinstance(input_tensor, DTensor) and input_tensor.size() != torch.Size([0]):
-        device_mesh = get_device_mesh()
+        spmd_mesh = get_device_mesh('spmd')
         if specs != input_tensor._spec.placements:
-            return input_tensor.redistribute(device_mesh, specs).contiguous()
+            return input_tensor.redistribute(spmd_mesh, specs).contiguous()
     return input_tensor.contiguous()
 
 
@@ -163,13 +163,13 @@ def insert_spmd_head(body):
 @torch.no_grad()
 def to_dtensor(input_tensor, placements=None, global_size=None):
     if isinstance(input_tensor, torch.Tensor) and not isinstance(input_tensor, DTensor):
-        device_mesh = get_device_mesh()
+        spmd_mesh = get_device_mesh('spmd')
         if placements is None:
-            placements = [Replicate()] * device_mesh.ndim
+            placements = [Replicate()] * spmd_mesh.ndim
         if global_size is None:
-            return DTensor.from_local(input_tensor, device_mesh, placements)
+            return DTensor.from_local(input_tensor, spmd_mesh, placements)
         else:
-            return DTensor(input_tensor, device_mesh, placements, size=global_size)
+            return DTensor(input_tensor, spmd_mesh, placements, size=global_size)
     return input_tensor
 
 
@@ -199,16 +199,16 @@ def fix_in_gragh_tensor(fx_module: torch.fx.GraphModule, sharding_strategy):
                     # but the local shape need to be consistent of runtime
                     global_shape = node.args[0]
                     local_shape = list(global_shape)
-                    device_mesh = get_device_mesh()
-                    if isinstance(device_mesh, MockDeviceMesh):
+                    spmd_mesh = get_device_mesh('spmd')
+                    if isinstance(spmd_mesh, MockDeviceMesh):
                         logger.warning("maybe wrong shape in MockDeviceMesh for create ops.")
                     for idx, placement in enumerate(strategy):
                         if placement.is_shard():
                             shard_dim = placement.dim
                             split_size, pad_idx = divmod(global_shape[shard_dim],
-                                                         device_mesh.size(idx))
+                                                         spmd_mesh.size(idx))
                             local_shape[shard_dim] = split_size
-                            if device_mesh_rank(device_mesh, idx) < pad_idx:
+                            if spmd_mesh.get_coordinate()[idx] < pad_idx:
                                 local_shape[shard_dim] = split_size + 1
 
                     node.update_arg(0, local_shape)
@@ -287,11 +287,19 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
                      sorted_placements,
                      copy_innode=None):
 
-    device_mesh = get_device_mesh()
+    spmd_mesh = get_device_mesh('spmd')
+
+    spmd_axis_namelist = get_device_mesh()._binding['spmd']
+    if len(spmd_axis_namelist) != 2:
+        raise NotImplementedError("only support DeviceMesh with 2D SPMD axis (`spmd1` and `spmd2`)")
 
     for i, (current, target) in sorted_placements:
-        my_coordinate = device_mesh.get_coordinate()
-        num_chunks = device_mesh.size(dim=i)
+        my_coordinate = spmd_mesh.get_coordinate()
+        num_chunks = spmd_mesh.size(mesh_dim=i)
+
+        spmd_axis_name = spmd_axis_namelist[i]
+        submesh = get_device_mesh(spmd_axis_name)
+        ranks = submesh.mesh.flatten().tolist()
 
         if current == target:
             continue
@@ -314,8 +322,6 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
             elif current.is_shard():
                 # all_to_all
                 with fx_module.graph.inserting_before(node):
-                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
-                    ranks = submesh.mesh.flatten().tolist()
                     all_to_all_start_node = fx_module.graph.call_function(
                         all_to_all_start,
                         args=(var_, current.args["dim"], target.args["dim"], num_chunks,
@@ -335,8 +341,6 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
             elif current.is_partial():
                 # reduce_scatter
                 with fx_module.graph.inserting_before(node):
-                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
-                    ranks = submesh.mesh.flatten().tolist()
                     reduceOp = reduce_map[current.args["ops"]]
                     # make sure contiguous
                     reduce_scatter_start_node = fx_module.graph.call_function(
@@ -358,8 +362,6 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
             if current.is_shard():
                 # insert all_gather here
                 with fx_module.graph.inserting_before(node):
-                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
-                    ranks = submesh.mesh.flatten().tolist()
                     # make sure contiguous
                     all_gather_start_node = fx_module.graph.call_function(
                         all_gather_start, args=(var_, current.args["dim"], ranks))
@@ -376,8 +378,6 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
             elif current.is_partial():
                 # insert all_reduce here
                 with fx_module.graph.inserting_before(node):
-                    submesh = mesh_resources.create_child_mesh(device_mesh, i)
-                    ranks = submesh.mesh.flatten().tolist()
                     reduceOp = reduce_map[current.args["ops"]]
                     all_reduce_start_node = fx_module.graph.call_function(all_reduce_start,
                                                                           args=(var_, reduceOp,
@@ -399,7 +399,7 @@ def insert_comm_node(fx_module: torch.fx.GraphModule,
 
 # some of this part from torch/distributed/_tensor/ops/view_ops.py
 def override_args(node, invars_strategy):
-    device_mesh = get_device_mesh()
+    spmd_mesh = get_device_mesh('spmd')
 
     if node.target in view_op_map:
         global_in_shape = node.args[0].meta['val'].shape
@@ -416,11 +416,13 @@ def override_args(node, invars_strategy):
             input_dtensor_spec,
             tuple(global_in_shape),
             rules,
-            tuple(device_mesh.mesh.shape),
+            tuple(spmd_mesh.mesh.shape),
         )
 
-        local_out_shape = compute_local_shape(list(global_out_shape), device_mesh, shard_out)
-
+        if shard_out is None:  # no need to reshard
+            shard_out = input_dtensor_spec
+        local_out_shape = compute_local_shape(list(global_out_shape), spmd_mesh, shard_out)
+        
         node.update_arg(shape_argnum, local_out_shape)
 
 
@@ -485,10 +487,10 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
                     fx_module = insert_comm_node(fx_module, node, var_, sorted_placements)
 
             shard_env[node.name] = opt_strategy[node.name]['strategy'].out_strtg_group
-            if len(shard_env[node.name]) == 1:
+            if len(shard_env[node.name]) == 1 and node.target not in ANNOTATION_OPS:  # ANNOTATION_OPS returns tensor list, no need to unwrap
                 shard_env[node.name] = shard_env[node.name][0]
 
-        if node.op == 'output':
+        elif node.op == 'output':
             need_replicate_node = node.args[0][-1 * num_return_value:]
             need_replicate_node = [i for i in need_replicate_node if i is not None]
             for o_node in need_replicate_node:
@@ -536,8 +538,8 @@ def sharding_transform(fx_module: torch.fx.GraphModule, opt_strategy, state_io_m
             node.ed_info.node_type = EDNodeType.AUXILIARY
         elif node.op == 'call_function':
             # create meta for custom function
-            if node.target in CUSTOM_FUNCS:
-                node.meta = create_meta_from_node(node)
+            # if node.target in CUSTOM_FUNCS:
+            node.meta = create_meta_from_node(node)
             # annotate node type
             if node.target in COMM_FUNCS:
                 node.ed_info.node_type = EDNodeType.COMMUNICATION

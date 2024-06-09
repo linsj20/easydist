@@ -43,7 +43,6 @@ def get_long_description():
         long_description = fh.read()
     return long_description
 
-
 setuptools.setup(
     name="pai-easydist",
     version=version,
@@ -54,6 +53,7 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/alibaba/easydist",
     packages=setuptools.find_packages(),
+    include_package_data=True,
     install_requires=get_core_requirements(),
     extras_require={
         "torch": [
@@ -65,4 +65,9 @@ setuptools.setup(
             "flax",
         ]
     },
+    entry_points = {
+        'console_scripts': [
+            'tfield-server = easydist.torch.tensorfield.server:main'
+        ]
+    }
 )

@@ -6,21 +6,24 @@ import os
 import sys
 from functools import partial
 from contextlib import nullcontext
+import ctypes
 
 import torch
 import torch.optim as optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.distributed._tensor import DeviceMesh
 
 from easydist import easydist_setup, mdconfig
-from easydist.torch.api import easydist_compile
+from easydist.torch.api import easydist_compile, set_device_mesh
 from easydist.utils.timer import EDTimer
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from benchmark.torch.model import GPT, GATLayer, wresnet50
 from benchmark.bench_case import GPTCase, ResNetCase, GATCase
 
+torch.manual_seed(0)
 
 def get_gpt_case():
     case = GPTCase()
@@ -134,17 +137,25 @@ def bench_easydist(model, data_in):
     train_step_partial()
 
     torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
+
+    # TODO(wuhao): temporarily banned torch.cuda.reset_peak_memory_stats(), 
+    # because CUDAPluggableAllocator didn't support this method
+
+    # torch.cuda.reset_peak_memory_stats()
 
     timer = EDTimer(train_step_partial, in_ms=False)
 
     elaps_time = timer.time()
-    peak_memory = torch.cuda.max_memory_allocated()
+
+    # TODO(wuhao): temporarily banned torch.cuda.max_memory_allocated(), 
+    # because CUDAPluggableAllocator didn't support this method
+ 
+    # peak_memory = torch.cuda.max_memory_allocated()
+    peak_memory = 0
 
     local_rank = int(os.environ["LOCAL_RANK"])
     print(f"[{local_rank}] Memory: {peak_memory / 1024 / 1024 / 1024} GB")
     print(f"[{local_rank}] Time: {elaps_time}")
-
 
 def main():
 
@@ -156,17 +167,25 @@ def main():
                         choices=["gpt", "resnet", "gat"],
                         required=True)
     parser.add_argument("--fake-init", action="store_true")
+    parser.add_argument("--spmd0", type=int, default=1)
+    parser.add_argument("--spmd1", type=int, default=1)
 
     args = parser.parse_args()
 
+    spmd0, spmd1 = args.spmd0, args.spmd1
+
     # setup easydist
-    mdconfig.log_level = logging.INFO
     easydist_setup(backend="torch", device="cuda")
 
     # setup distributed
     torch.distributed.init_process_group(backend="nccl")
+    world_size = int(os.environ["WORLD_SIZE"])
+    if spmd0 * spmd1 != world_size:
+        raise ValueError("spmd0 * spmd1 should be equal to world_size")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
+    device_mesh = DeviceMesh('cuda', torch.arange(world_size).reshape(spmd0, spmd1), mesh_dim_names=['spmd0', 'spmd1'])
+    set_device_mesh(device_mesh)
 
     fake_mode = FakeTensorMode()
     # (NOTE) initialize cuda context first see https://github.com/pytorch/pytorch/issues/92627

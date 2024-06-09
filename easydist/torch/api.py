@@ -24,30 +24,52 @@ import torch.utils._pytree as pytree
 from torch.distributed._tensor import DeviceMesh
 
 import easydist.config as mdconfig
-from easydist.torch.device_mesh import (device_mesh_world_size, get_device_mesh, set_device_mesh)
-from easydist.torch.compiler import _compile
+from easydist.torch.device_mesh import (get_device_mesh, set_device_mesh)
+from easydist.torch.compile_auto import _compile_auto
+from easydist.torch.compile_dp import _compile_dp
+from easydist.torch.experimental.pp.api import _compile_pp
 from easydist.torch.init_helper import (CpuModuleInitHelper, SetParaInitHelper)
 from easydist.torch.utils import get_input_signature
 
 logger = logging.getLogger(__name__)
+
+PARALLEL_EXTENTION = dict()
+
+
+def register_parallel_method(parallel_mode: str, compiler_func=None):
+
+    def wrapper(compiler_func):
+        global PARALLEL_EXTENTION
+        PARALLEL_EXTENTION[parallel_mode] = compiler_func
+        logger.info(f"Register parallel method [{parallel_mode}]: {compiler_func}")
+        return compiler_func
+
+    if compiler_func is None:
+        return wrapper
+    else:
+        return wrapper(compiler_func)
 
 
 class CompiledFuncWrapper:
 
     def __init__(self,
                  func,
+                 parallel_mode="auto",
                  tracing_mode="fake",
                  cuda_graph=True,
                  enable_mono_graph=False,
-                 compile_only=False) -> None:
+                 compile_only=False,
+                 compile_kwargs={}) -> None:
         update_wrapper(self, func)
         self.original_func = func
 
         self.compiled_func = None
+        self.parallel_mode = parallel_mode
         self.tracing_mode = tracing_mode
         self.enable_cuda_graph = cuda_graph
         self.enable_mono_graph = enable_mono_graph
         self.compile_only = compile_only
+        self.compile_kwargs = compile_kwargs
 
         self.init_helper = SetParaInitHelper()
 
@@ -85,25 +107,39 @@ class CompiledFuncWrapper:
 
         input_signature = self.register_input_signature(*args, **kwargs)
 
-        # skip compile when only one device
-        world_size = torch.distributed.get_world_size()
-        need_compile = world_size >= 2
-        if get_device_mesh() is not None:
-            need_compile = device_mesh_world_size() >= 2
+        # local_pp is for testing and debugging
+        if 'local_pp_stage_cnt' in self.compile_kwargs:
+            # for running pp in single node (debug)
+            world_size = self.compile_kwargs['local_pp_stage_cnt']
+        else:
+            world_size = torch.distributed.get_world_size()
+
+        mesh = get_device_mesh()
+        need_compile = mesh.size() >= 2
 
         # override need_compile with forced_compile env var
         if mdconfig.forced_compile:
             need_compile = True
 
         if need_compile and self.compiled_func is None:
-            mesh_shape = numpy.array(range(world_size)).reshape(1, -1)
-            mesh = DeviceMesh("cuda", mesh_shape.tolist())
 
-            if get_device_mesh() == None:
-                set_device_mesh(mesh)
-
-            self.compiled_func = _compile(self.original_func, self.tracing_mode, self.init_helper,
-                                          input_signature, args, kwargs)
+            if self.parallel_mode == "auto":
+                self.compiled_func = _compile_auto(self.original_func, self.tracing_mode,
+                                                   self.init_helper, input_signature, args, kwargs, **self.compile_kwargs)
+            elif self.parallel_mode == "pp":
+                self.compiled_func = _compile_pp(self.original_func, self.tracing_mode,
+                                                self.init_helper, input_signature, args, kwargs,
+                                                **self.compile_kwargs)
+            elif self.parallel_mode in ["ddp", "zero2", "zero3"]:
+                self.compiled_func = _compile_dp(self.original_func, self.parallel_mode,
+                                                 self.tracing_mode, args, kwargs)
+            elif self.parallel_mode in PARALLEL_EXTENTION:
+                self.compiled_func = PARALLEL_EXTENTION[self.parallel_mode](self.original_func,
+                                                                            self.parallel_mode,
+                                                                            self.tracing_mode,
+                                                                            args, kwargs)
+            else:
+                raise NotImplementedError()
             self.graph_list[input_signature] = self.compiled_func.graph
             # release the cpu module when finised pre-shard in _compiler
             self.init_helper = None
@@ -186,24 +222,32 @@ class CompiledFuncWrapper:
 
 
 def easydist_compile(func=None,
+                     parallel_mode="auto",
                      tracing_mode="fake",
                      cuda_graph=True,
                      enable_mono_graph=False,
                      use_hint=False,
                      liveness_only_input=False,
                      max_solver_time=float("inf"),
-                     compile_only=False):
+                     compile_only=False,
+                     **compile_kwargs):
 
     mdconfig.use_hint = use_hint
     mdconfig.liveness_only_input = liveness_only_input
     mdconfig.max_seconds_same_incumbent = max_solver_time
 
+    if parallel_mode not in ["auto", "pp", "ddp", "zero2", "zero3"
+                             ] and parallel_mode not in PARALLEL_EXTENTION:
+        raise NotImplementedError(
+            "please use [auto, ddp, zero2, zero3] for `parallel_mode` or register your parallel extention"
+        )
     if func:
-        return CompiledFuncWrapper(func, tracing_mode, cuda_graph, enable_mono_graph, compile_only)
+        return CompiledFuncWrapper(func, parallel_mode, tracing_mode, cuda_graph,
+                                   enable_mono_graph, compile_only, compile_kwargs)
     else:
 
         def wrapper(func):
-            return CompiledFuncWrapper(func, tracing_mode, cuda_graph, enable_mono_graph,
-                                       compile_only)
+            return CompiledFuncWrapper(func, parallel_mode, tracing_mode, cuda_graph,
+                                       enable_mono_graph, compile_only, compile_kwargs)
 
         return wrapper
