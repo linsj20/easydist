@@ -25,6 +25,7 @@ import easydist.config as mdconfig
 import easydist.torch.schedule.rcpsp as rcpsp
 from easydist.torch.passes.sharding import create_meta_from_node
 from easydist.torch.utils import EDInfo, EDNodeType
+from easydist.torch.utils import _link_nodes
 
 logger = logging.getLogger(__name__)
 
@@ -393,18 +394,3 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
         logger.info("Communication Optimization: Done!")
     return fx_module
 
-
-def _link_nodes(fx_module, node_list):
-    '''
-    Change the topological order of fx_module according to node_list
-    '''
-
-    fx_module.graph._root._next = node_list[0]
-    node_list[0]._prev = fx_module.graph._root
-    for idx, node in enumerate(node_list[:-1]):
-        node._next = node_list[idx + 1]
-        node_list[idx + 1]._prev = node
-    node_list[-1]._next = fx_module.graph._root
-    fx_module.graph._root._prev = node_list[-1]
-    fx_module.graph.eliminate_dead_code()
-    fx_module.recompile()

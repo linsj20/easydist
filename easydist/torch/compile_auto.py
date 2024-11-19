@@ -15,57 +15,69 @@
 import logging
 import os
 import pickle
-import time
-import threading
-from functools import partial, reduce
-from typing import Any, Union, Set, Dict, List, Tuple, Callable
-
-import rich
-import intervaltree
-import torch
-import torch.utils._pytree as pytree
-import torch.distributed.rpc as rpc
-from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
-from torch.distributed._tensor import (DeviceMesh, DTensor, Replicate, distribute_tensor)
-from torch.fx._pytree import tree_flatten_spec
-from torch.fx.experimental.proxy_tensor import make_fx
-from torch.fx.passes.graph_drawer import FxGraphDrawer
-from torch._functorch.partitioners import default_partition
-
-import easydist.config as mdconfig
-from easydist.autoflow.solver import AutoFlowSolver1D
-from easydist.metashard.metair import SPMD, VarSPMDStrategy
-from easydist.torch.bridge import (get_torch_sharding_strategy, to_torch_spmd, torch2meta_graph)
-from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
-from easydist.torch.experimental.pp.runtime import PipelineStage, ScheduleGPipe
-from easydist.torch.experimental.pp.compile_pipeline import compile_pipeline
-from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
-from easydist.torch.experimental.pp.split_utils import set_backward_flag, set_step_flag, set_updated_params_states
-from easydist.torch.experimental.pp.utils import save_graphviz_dot
-from easydist.torch.init_helper import (init_contiguous_buf, materialize_zero)
-from easydist.torch.passes import (eliminate_detach, fix_addmm_bias, fix_convoluation_bias, decouple_view,
-                                   tile_comm, runtime_prof, fix_embedding, fix_meta_device,
-                                   sharding_transform, sharding_transform_dtensor,
-                                   AllocatorProfiler, ModuleProfilingInfo)
-from easydist.torch.device_mesh import get_device_mesh
-from easydist.torch.passes import comm_optimize, rule_override_by_graph, create_edinfo
-from easydist.torch.passes.fix_node_order import fix_node_order
-from easydist.torch.schedule.ilp_memory_scheduler import ILPMemoryScheduler
-from easydist.torch.schedule.efficient_memory_scheduler import EfficientMemoryScheduler
-from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
-from easydist.torch.sharding_interpreter import EDTorchShardingAnn
-from easydist.torch.compile import ed_compile_func, stateless_func
-from easydist.torch.utils import (_enable_compile, _sharding_ann_env, extract_tensor_meta_info)
-from easydist.utils.testing.mock import TorchMockDeviceMesh
-from easydist.torch.mem_allocation_info import OutVar
-import easydist.torch.profiler.stream_tracer as ed_stream_tracer
-from easydist.torch.meta_allocator import profiling_allocator
-from easydist.torch.schedule.lifetime_info import mem_owner_tracer
-from easydist.torch.scope_auto.build_scope_modules import build_scope_modules
-from easydist.torch.reachability import ReachabilityMap
 
 # for pickle dump opt_strategy
 import sys
+import threading
+import time
+from functools import partial, reduce
+from typing import Any, Callable, Dict, List, Set, Tuple
+
+import intervaltree
+import rich
+import torch
+import torch.distributed.rpc as rpc
+import torch.utils._pytree as pytree
+from torch._functorch.partitioners import default_partition
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+from torch.distributed._tensor import DTensor, Replicate, distribute_tensor
+from torch.fx._pytree import tree_flatten_spec
+from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.passes.graph_drawer import FxGraphDrawer
+
+import easydist.config as mdconfig
+import easydist.torch.profiler.stream_tracer as ed_stream_tracer
+from easydist.autoflow.solver import AutoFlowSolver1D
+from easydist.metashard.metair import SPMD, VarSPMDStrategy
+from easydist.torch.bridge import (
+    get_torch_sharding_strategy,
+    to_torch_spmd,
+    torch2meta_graph,
+)
+from easydist.torch.compile import ed_compile_func, stateless_func
+from easydist.torch.decomp_utils import EASYDIST_DECOMP_TABLE
+from easydist.torch.device_mesh import get_device_mesh
+from easydist.torch.experimental.pp.compile_pipeline import compile_pipeline
+from easydist.torch.experimental.pp.microbatch import split_args_kwargs_into_chunks
+from easydist.torch.experimental.pp.runtime import PipelineStage
+from easydist.torch.experimental.pp.utils import save_graphviz_dot
+from easydist.torch.init_helper import init_contiguous_buf, materialize_zero
+from easydist.torch.mem_allocation_info import OutVar
+from easydist.torch.meta_allocator import profiling_allocator
+from easydist.torch.passes import (
+    AllocatorProfiler,
+    ModuleProfilingInfo,
+    comm_optimize,
+    create_edinfo,
+    decouple_view,
+    eliminate_detach,
+    fix_addmm_bias,
+    fix_embedding,
+    fix_meta_device,
+    get_partition,
+    rule_override_by_graph,
+    runtime_prof,
+    sharding_transform,
+    sharding_transform_dtensor,
+    tile_comm,
+)
+from easydist.torch.reachability import ReachabilityMap
+from easydist.torch.schedule.efficient_memory_scheduler import EfficientMemoryScheduler
+from easydist.torch.schedule.graph_mem_plan import GraphMemPlan
+from easydist.torch.schedule.ilp_memory_scheduler import ILPMemoryScheduler
+from easydist.torch.schedule.lifetime_info import mem_owner_tracer
+from easydist.torch.sharding_interpreter import EDTorchShardingAnn
+from easydist.torch.utils import _enable_compile, _sharding_ann_env, do_spmd_comm
 
 sys.setrecursionlimit(100000)
 
@@ -133,8 +145,8 @@ def easydist_shard(fx_module: torch.fx.GraphModule, state_tensor_num,
                                           opt_strtg_per_mesh_dim, dim_size)
 
             if mdconfig.log_level <= logging.DEBUG:
-                rich.print(meta_graph) 
-            
+                rich.print(meta_graph)
+
             # (3) construct AutoFlowSolver and run ILP
             solver = AutoFlowSolver1D(dim_size, mesh_dim=dim, total_memery=total_memory,
                                       reachability_map=reachability_map)
@@ -483,6 +495,8 @@ def _compile_auto(func,
 
     params, buffers, named_states, state_tensor_num, traced_graph = ed_compile_func(func, tracing_mode, init_helper, args, kwargs, schedule_cls, module, opt)
     traced_graph = preprocess_traced_graph(traced_graph)
+    if schedule_cls:  # for pp, record current node partitions for later sanity check
+        orig_partitions = get_partition(traced_graph)
 
     if mdconfig.dump_fx_graph:
         print(f"node num in traced graph: {len(traced_graph.graph.nodes)}")
@@ -545,9 +559,6 @@ def _compile_auto(func,
 
     rpc.shutdown()
 
-    #if rank == 0:
-    #    print(f"traced_graph._code: {traced_graph._code}")
-
     if mdconfig.dump_strategy and rank==0:
         nodes_shape_info = "shape info:\n"
         for node in traced_graph.graph.nodes:
@@ -575,7 +586,7 @@ def _compile_auto(func,
     sharded_gm = fix_embedding(sharded_gm, recover=True)
 
     if not mdconfig.use_dtensor:
-        if schedule_cls is None and mdconfig.comm_optimization is True:
+        if schedule_cls is None and mdconfig.comm_optimization is True:  # TODO @botbw: for pp, optimize comm within stage
             sharded_gm = runtime_prof(sharded_gm)
             sharded_gm = comm_optimize(sharded_gm, 'rcpsp', grouping=True, mem_restrain=False)
 
@@ -681,13 +692,16 @@ def _compile_auto(func,
     named_states = pytree.tree_unflatten(flat_named_states, named_states_spec)
 
     if schedule_cls is not None:
+        cur_node_partitions = get_partition(sharded_gm)
+        for i, (org, cur) in enumerate(zip(orig_partitions, cur_node_partitions)):
+            assert org.issubset(cur), f"Some passes might reordered the linear sequence of nodes, which lead to different partitions: {i} {org} {cur} {org - cur}"
+
         pp_mesh = get_device_mesh('pp')
         pp_rank, pp_size = pp_mesh.get_coordinate()[0], pp_mesh.size()
         traced_graph_node_metas = {
             node.name: node.meta
             for node in traced_graph.graph.nodes
         }
-        sharded_gm = fix_node_order(sharded_gm)
         stateless_func_args = (params, buffers, named_states, args, kwargs)
         pp_compiled_meta, pp_compiled_stages, pp_local_gm, _ = compile_pipeline(
             sharded_gm,
@@ -755,8 +769,8 @@ def _compile_auto(func,
                 params, buffers, named_states, grads, sharded_out = graph(
                     params, buffers, named_states, args, kwargs)
 
-            for para_name in params:
-                params[para_name].grad = grads[para_name]
+            # for para_name in params:
+            #     params[para_name].grad = grads[para_name]  # TODO @botbw: shape error?
 
             # out from DTensor to Tensor
             local_out = pytree.tree_map(dtensor_to_tensor, sharded_out)
@@ -800,19 +814,54 @@ def _compile_auto(func,
             return sharded_fx_module
 
         def parameters(self):
-            return params.values()
+            gathered = []
+            for idx, param_name in enumerate(params):
+                src_specs = params_strategy[idx]
+                tgt_specs = [Replicate()] * len(src_specs)
+                tensor = do_spmd_comm(params[param_name], src_specs, tgt_specs)
+                gathered.append(tensor)
+            return iter(gathered)
 
         def named_parameters(self):
-            return params
+            gathered = {}
+            for idx, param_name in enumerate(params):
+                src_specs = params_strategy[idx]
+                tgt_specs = [Replicate()] * len(src_specs)
+                tensor = do_spmd_comm(params[param_name], src_specs, tgt_specs)
+                gathered[param_name] = tensor
+            return gathered
 
         def buffers(self):
-            return buffers.values()
+            gathered = []
+            for idx, buffer_name in enumerate(buffers):
+                src_specs = buffers_strategy[idx]
+                tgt_specs = [Replicate()] * len(src_specs)
+                tensor = do_spmd_comm(buffers[buffer_name], src_specs, tgt_specs)
+                gathered.append(tensor)
+            return iter(gathered)
 
         def named_buffers(self):
-            return buffers
+            gathered = {}
+            for idx, buffer_name in enumerate(buffers):
+                src_specs = buffers_strategy[idx]
+                tgt_specs = [Replicate()] * len(src_specs)
+                tensor = do_spmd_comm(buffers[buffer_name], src_specs, tgt_specs)
+                gathered[buffer_name] = tensor
+            return gathered
 
         def _optimizer_state_dict(self):
-            return named_states
+            gathered = []
+            flat_named_states, named_states_spec = pytree.tree_flatten(named_states)
+            state_tensor_num = len(params) + len(buffers)
+            for i in range(len(flat_named_states)):
+                if isinstance(flat_named_states[i], torch.Tensor):
+                    src_specs = args_strategy[state_tensor_num]
+                    tgt_specs = [Replicate()] * len(src_specs)
+                    gathered.append(
+                        do_spmd_comm(flat_named_states[i], src_specs, tgt_specs)
+                    )
+                    state_tensor_num += 1
+            return pytree.tree_unflatten(gathered, named_states_spec)
 
     # release all cuda memory from module here
     # the param maintain in the local of compiled function.

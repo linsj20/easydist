@@ -13,49 +13,49 @@
 # ==============================================================================
 
 from contextlib import nullcontext
-from typing import List, Union, Tuple, Any, Sequence, Optional, cast
+from typing import List, Optional, Sequence, Tuple, cast
 
 import torch
 import torch._custom_ops
-
-from easydist.torch.utils import _rematerialize_optimizer
 import torch.utils._pytree as pytree
 from torch.fx._symbolic_trace import _Patcher
 from torch.nn.utils import stateless
+
 from easydist.torch.split_utils import (
-    list_before_split,
-    list_after_split,
-    _before_split,
     _after_split,
+    _before_split,
+    list_after_split,
+    list_before_split,
 )
+from easydist.torch.utils import _rematerialize_optimizer
 
 '''
-The valid parameters types are: 
+The valid parameters types are:
 dict_keys([
-    <class 'torch.Tensor'>, 
-    typing.Optional[torch.Tensor], 
-    typing.Sequence[torch.Tensor], 
+    <class 'torch.Tensor'>,
+    typing.Optional[torch.Tensor],
+    typing.Sequence[torch.Tensor],
     typing.Sequence[typing.Optional[torch.Tensor]],
-    <class 'int'>, 
-    typing.Optional[int], 
-    typing.Sequence[int], 
-    typing.Optional[typing.Sequence[int]], 
-    <class 'float'>, 
-    typing.Optional[float], 
-    typing.Sequence[float], 
-    typing.Optional[typing.Sequence[float]], 
-    <class 'bool'>, 
-    typing.Optional[bool], 
-    typing.Sequence[bool], 
-    typing.Optional[typing.Sequence[bool]], 
-    <class 'str'>, 
-    typing.Optional[str], 
-    typing.Union[int, float, bool], 
-    typing.Union[int, float, bool, NoneType], 
+    <class 'int'>,
+    typing.Optional[int],
+    typing.Sequence[int],
+    typing.Optional[typing.Sequence[int]],
+    <class 'float'>,
+    typing.Optional[float],
+    typing.Sequence[float],
+    typing.Optional[typing.Sequence[float]],
+    <class 'bool'>,
+    typing.Optional[bool],
+    typing.Sequence[bool],
+    typing.Optional[typing.Sequence[bool]],
+    <class 'str'>,
+    typing.Optional[str],
+    typing.Union[int, float, bool],
+    typing.Union[int, float, bool, NoneType],
     typing.Sequence[typing.Union[int, float, bool]],
-    <class 'torch.dtype'>, 
-    typing.Optional[torch.dtype], 
-    <class 'torch.device'>, 
+    <class 'torch.dtype'>,
+    typing.Optional[torch.dtype],
+    <class 'torch.device'>,
     typing.Optional[torch.device]]
     )
 '''
@@ -193,12 +193,14 @@ def set_step_flag(flag):
     global __step_flag
     __step_flag = flag
 
+fw_bw_splitted = False
 
 def clear_pp_compile_states():
     set_backward_flag(False)
     set_updated_params_states(None, None)
     set_step_flag(False)
-
+    global fw_bw_splitted
+    fw_bw_splitted = False
 
 def get_registered_by_mro(registered, cls_begin: type) -> type:
     for cls in cls_begin.mro():
@@ -215,7 +217,6 @@ def split(ret):
     ret = get_registered_by_mro(_after_split, cls_ret)(ctx, tensor_tuple_after_split)
     return ret
 
-fw_bw_splitted = False
 class SplitPatcher(_Patcher):
 
     def __init__(self, module: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -270,23 +271,23 @@ class SplitPatcher(_Patcher):
                     if p in self.optimizer.state:
                         named_states[n] = self.optimizer.state[p]
 
-                states, spec = pytree.tree_flatten((params, grads, named_states))
+                states, spec = pytree.tree_flatten((params, grads))
 
                 ctx = {}
                 states = list_before_split(ctx, states)
                 states = split_func_optimizier_step(states)
                 states = list_after_split(ctx, states)
-                params, split_grads, named_states = pytree.tree_unflatten(states, spec)
+                split_params, split_grads = pytree.tree_unflatten(states, spec)
 
-                for n, p in params.items():  # need to split on grads
+                for n, p in split_params.items():  # need to split on grads
                     p.grad = split_grads[n]
 
                 with stateless._reparametrize_module(
-                        cast(torch.nn.Module, self.module), params, tie_weights=True) if self.module else nullcontext(), _rematerialize_optimizer(
-                            optimizer, named_states, params) if optimizer else nullcontext():
+                        cast(torch.nn.Module, self.module), split_params, tie_weights=True) if self.module else nullcontext(), _rematerialize_optimizer(
+                            optimizer, named_states, split_params) if optimizer else nullcontext():
                     orig_step(optimizer, *args, **kwargs)
 
-                set_updated_params_states(params, named_states)
+                set_updated_params_states(split_params, named_states)
                 set_step_flag(True)
 
             patcher.patch_method(opt_cls, 'step', step_wrapper, deduplicate=False)

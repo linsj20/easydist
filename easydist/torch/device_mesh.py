@@ -135,7 +135,10 @@ def set_device_mesh(torch_mesh: DeviceMesh, default_binding: bool=True):
             bind_func(__GLOBAL_ND_DEVICEMESH)
 
     # TODO @botbw: better implementation for mesh initializtion
-    _ = get_device_mesh('spmd')
+    for name in __GLOBAL_ND_DEVICEMESH.mesh_dim_names:
+        if "spmd" in name:
+            _ = get_device_mesh('spmd')
+            break
 
     logger.info(f"set_device_mesh: {torch_mesh}")
 
