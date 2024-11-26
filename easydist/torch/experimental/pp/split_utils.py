@@ -13,42 +13,49 @@
 # ==============================================================================
 
 from contextlib import nullcontext
-from typing import List, Union, Tuple, Any, Dict, Callable, Sequence, Optional, cast
+from typing import List, Optional, Sequence, Tuple, cast
 
 import torch
 import torch._custom_ops
-
-from easydist.torch.utils import _rematerialize_optimizer
 import torch.utils._pytree as pytree
 from torch.fx._symbolic_trace import _Patcher
 from torch.nn.utils import stateless
+
+from easydist.torch.split_utils import (
+    _after_split,
+    _before_split,
+    list_after_split,
+    list_before_split,
+)
+from easydist.torch.utils import _rematerialize_optimizer
+
 '''
-The valid parameters types are: 
+The valid parameters types are:
 dict_keys([
-    <class 'torch.Tensor'>, 
-    typing.Optional[torch.Tensor], 
-    typing.Sequence[torch.Tensor], 
+    <class 'torch.Tensor'>,
+    typing.Optional[torch.Tensor],
+    typing.Sequence[torch.Tensor],
     typing.Sequence[typing.Optional[torch.Tensor]],
-    <class 'int'>, 
-    typing.Optional[int], 
-    typing.Sequence[int], 
-    typing.Optional[typing.Sequence[int]], 
-    <class 'float'>, 
-    typing.Optional[float], 
-    typing.Sequence[float], 
-    typing.Optional[typing.Sequence[float]], 
-    <class 'bool'>, 
-    typing.Optional[bool], 
-    typing.Sequence[bool], 
-    typing.Optional[typing.Sequence[bool]], 
-    <class 'str'>, 
-    typing.Optional[str], 
-    typing.Union[int, float, bool], 
-    typing.Union[int, float, bool, NoneType], 
+    <class 'int'>,
+    typing.Optional[int],
+    typing.Sequence[int],
+    typing.Optional[typing.Sequence[int]],
+    <class 'float'>,
+    typing.Optional[float],
+    typing.Sequence[float],
+    typing.Optional[typing.Sequence[float]],
+    <class 'bool'>,
+    typing.Optional[bool],
+    typing.Sequence[bool],
+    typing.Optional[typing.Sequence[bool]],
+    <class 'str'>,
+    typing.Optional[str],
+    typing.Union[int, float, bool],
+    typing.Union[int, float, bool, NoneType],
     typing.Sequence[typing.Union[int, float, bool]],
-    <class 'torch.dtype'>, 
-    typing.Optional[torch.dtype], 
-    <class 'torch.device'>, 
+    <class 'torch.dtype'>,
+    typing.Optional[torch.dtype],
+    <class 'torch.device'>,
     typing.Optional[torch.device]]
     )
 '''
@@ -186,38 +193,14 @@ def set_step_flag(flag):
     global __step_flag
     __step_flag = flag
 
+fw_bw_splitted = False
 
 def clear_pp_compile_states():
     set_backward_flag(False)
     set_updated_params_states(None, None)
     set_step_flag(False)
-
-
-_before_split: Dict[type, Callable[[Any], Tuple[torch.Tensor]]] = {}
-_after_split: Dict[type, Callable[[Tuple[torch.Tensor]], Any]] = {}
-
-
-def before_split_register(*classes):
-
-    def _register(func: Callable):
-        for cls in classes:
-            assert cls not in _before_split, f"split function for {cls} already registered"
-            _before_split[cls] = func
-        return func
-
-    return _register
-
-
-def after_split_register(*classes):
-
-    def _register(func: Callable):
-        for cls in classes:
-            assert cls not in _after_split, f"split function for {cls} already registered"
-            _after_split[cls] = func
-        return func
-
-    return _register
-
+    global fw_bw_splitted
+    fw_bw_splitted = False
 
 def get_registered_by_mro(registered, cls_begin: type) -> type:
     for cls in cls_begin.mro():
@@ -233,55 +216,6 @@ def split(ret):
     tensor_tuple_after_split: Tuple[torch.Tensor] = split_func_with_bw(tensor_tuple)
     ret = get_registered_by_mro(_after_split, cls_ret)(ctx, tensor_tuple_after_split)
     return ret
-
-
-@before_split_register(torch.Tensor)
-def tensor_before_split(ctx: dict, input: torch.Tensor) -> Tuple[torch.Tensor]:
-    return tuple([input])
-
-
-@after_split_register(torch.Tensor)
-def tensor_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> torch.Tensor:
-    return output[0]
-
-
-@before_split_register(list)
-def list_before_split(ctx: dict, input: List[Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor]:
-    ctx['is_tensor'] = []
-    ctx['non_tensor_vals'] = []
-    tup = []
-    for x in input:
-        ctx['is_tensor'].append(isinstance(x, torch.Tensor))
-        if ctx['is_tensor'][-1]:
-            tup.append(x)
-        else:
-            ctx['non_tensor_vals'].append(x)
-
-    return tuple(tup)
-
-
-@after_split_register(list)
-def list_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> List[Union[torch.Tensor, Any]]:
-    ret = []
-    output = list(output)
-    for is_tensor in ctx['is_tensor']:
-        if is_tensor:
-            ret.append(output.pop(0))
-        else:
-            ret.append(ctx['non_tensor_vals'].pop(0))
-    return ret
-
-
-@before_split_register(tuple)
-def tuple_before_split(ctx: dict, input: Tuple[Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor]:
-    return list_before_split(ctx, list(input))
-
-
-@after_split_register(tuple)
-def tuple_after_split(ctx: dict, output: Tuple[torch.Tensor]) -> Tuple[Union[torch.Tensor, Any]]:
-    return tuple(list_after_split(ctx, output))
-
-
 
 class SplitPatcher(_Patcher):
 
@@ -300,11 +234,16 @@ class SplitPatcher(_Patcher):
                              retain_graph: bool = None,
                              create_graph: bool = False,
                              inputs: Optional[Sequence[torch.Tensor]] = None):
-            tensor_list = [self] + (inputs or [])
-            tensor_list = split_func_without_bw(tensor_list)
-            self, inputs = tensor_list[0], tensor_list[1:]
-            if len(inputs) == 0:
-                inputs = None
+            global fw_bw_splitted
+            if not fw_bw_splitted:
+                # NOTE: temp fix because backward() may be called more than one
+                #       time in torch 2.5
+                tensor_list = [self] + (inputs or [])
+                tensor_list = split_func_without_bw(tensor_list)
+                self, inputs = tensor_list[0], tensor_list[1:]
+                fw_bw_splitted = True
+                if len(inputs) == 0:
+                    inputs = None
             orig_backward(self, gradient, retain_graph, create_graph, inputs)
             set_backward_flag(True)
 
@@ -332,23 +271,23 @@ class SplitPatcher(_Patcher):
                     if p in self.optimizer.state:
                         named_states[n] = self.optimizer.state[p]
 
-                states, spec = pytree.tree_flatten((params, grads, named_states))
+                states, spec = pytree.tree_flatten((params, grads))
 
                 ctx = {}
                 states = list_before_split(ctx, states)
                 states = split_func_optimizier_step(states)
                 states = list_after_split(ctx, states)
-                params, split_grads, named_states = pytree.tree_unflatten(states, spec)
+                split_params, split_grads = pytree.tree_unflatten(states, spec)
 
-                for n, p in params.items():  # need to split on grads
+                for n, p in split_params.items():  # need to split on grads
                     p.grad = split_grads[n]
 
                 with stateless._reparametrize_module(
-                        cast(torch.nn.Module, self.module), params, tie_weights=True) if self.module else nullcontext(), _rematerialize_optimizer(
-                            optimizer, named_states, params) if optimizer else nullcontext():
+                        cast(torch.nn.Module, self.module), split_params, tie_weights=True) if self.module else nullcontext(), _rematerialize_optimizer(
+                            optimizer, named_states, split_params) if optimizer else nullcontext():
                     orig_step(optimizer, *args, **kwargs)
 
-                set_updated_params_states(params, named_states)
+                set_updated_params_states(split_params, named_states)
                 set_step_flag(True)
 
             patcher.patch_method(opt_cls, 'step', step_wrapper, deduplicate=False)

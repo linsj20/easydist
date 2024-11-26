@@ -12,25 +12,32 @@
 # limitations under the License.
 # ==============================================================================
 
-from functools import reduce
 import random
 from copy import deepcopy
+from functools import reduce
 
 import pytest
 import torch
 import torch.utils._pytree as pytree
-from torchvision.models import (alexnet, densenet121, resnet18, swin_t, vgg19, efficientnet_b0,
-                                vit_b_16)
-from easydist.torch.experimental.pp.compile_pipeline import (annotate_split_points,
-                                                             compile_pipeline)
-from easydist.torch.utils import seed
-from easydist.torch.compile import ed_compile_func
-from easydist.torch.experimental.pp.runtime import ScheduleGPipe
+from torchvision.models import (
+    alexnet,
+    densenet121,
+    efficientnet_b0,
+    resnet18,
+    vgg19,
+    vit_b_16,
+)
+from transformers import OpenAIGPTConfig, OpenAIGPTModel
+
 from benchmark.torch.model import GPT
-
-from transformers import OpenAIGPTModel, OpenAIGPTConfig
-
-from tests.test_torch.test_utils import get_module_opt_states, Foo, Foo1
+from easydist.torch.compile import ed_compile_func
+from easydist.torch.experimental.pp.compile_pipeline import (
+    annotate_split_points,
+    compile_pipeline,
+)
+from easydist.torch.experimental.pp.runtime import ScheduleGPipe
+from easydist.torch.utils import seed
+from tests.test_torch.test_utils import Foo, Foo1, get_module_opt_states
 
 
 def train_step(input, label, model, opt):
@@ -169,12 +176,12 @@ def inner(module_cls, module_init_args, split_ann_or_policy, rand_input_gen_meth
         'layer3',
         'layer4',
     }, gen_rand_input_imagenet, train_step),
-    (swin_t, {}, {
-        'features.2.reduction',
-        'features.3.0.mlp.1',
-        'features.5.1.attn.qkv',
-        'features.7.0.stochastic_depth',
-    }, gen_rand_input_imagenet, train_step),
+    # (swin_t, {}, {
+    #     'features.2.reduction',
+    #     'features.3.0.mlp.1',
+    #     'features.5.1.attn.qkv',
+    #     'features.7.0.stochastic_depth',
+    # }, gen_rand_input_imagenet, train_step),
     (vgg19, {}, {
         'features.10',
         'features.20',

@@ -12,3 +12,7 @@ ninja
 nvidia-ml-py
 ray[default]
 cupy-cuda11x
+tqdm
+transformers
+bitarray
+

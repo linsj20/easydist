@@ -25,6 +25,7 @@ import easydist.config as mdconfig
 import easydist.torch.schedule.rcpsp as rcpsp
 from easydist.torch.passes.sharding import create_meta_from_node
 from easydist.torch.utils import EDInfo, EDNodeType
+from easydist.torch.utils import _link_nodes
 
 logger = logging.getLogger(__name__)
 
@@ -374,12 +375,14 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
             new_comm_node = fx_module.graph.call_function(grouped_comm,
                                                           args=(input_nodes, comm_funcs,
                                                                 comm_args))
+            new_comm_node.meta = create_meta_from_node(new_comm_node)
 
         # add retrive node
         for idx, comm_node in enumerate(comm_map[node]):
             with fx_module.graph.inserting_after(new_comm_node):
                 idx_node = fx_module.graph.call_function(operator.getitem,
                                                          args=(new_comm_node, idx))
+                idx_node.meta = create_meta_from_node(idx_node)
             comm_node.ed_info.comm_meta['to_node'].replace_input_with(comm_node, idx_node)
 
     # at this point all old comm operators should be eliminated
@@ -391,18 +394,3 @@ def comm_optimize(fx_module: torch.fx.GraphModule,
         logger.info("Communication Optimization: Done!")
     return fx_module
 
-
-def _link_nodes(fx_module, node_list):
-    '''
-    Change the topological order of fx_module according to node_list
-    '''
-
-    fx_module.graph._root._next = node_list[0]
-    node_list[0]._prev = fx_module.graph._root
-    for idx, node in enumerate(node_list[:-1]):
-        node._next = node_list[idx + 1]
-        node_list[idx + 1]._prev = node
-    node_list[-1]._next = fx_module.graph._root
-    fx_module.graph._root._prev = node_list[-1]
-    fx_module.graph.eliminate_dead_code()
-    fx_module.recompile()

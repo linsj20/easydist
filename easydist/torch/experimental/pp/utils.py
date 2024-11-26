@@ -15,15 +15,12 @@
 import logging
 import operator
 from copy import deepcopy
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import torch.fx as fx
-from torch.distributed._tensor import DTensor
-from torch.distributed._tensor.placement_types import Placement
 from torch.fx.passes.graph_drawer import FxGraphDrawer
 
 import easydist.config as mdconfig
-from easydist.torch.device_mesh import get_device_mesh
 
 
 def ordered_gi_users(node: fx.node):
@@ -36,9 +33,8 @@ def ordered_gi_users(node: fx.node):
 
 
 def save_graphviz_dot(gm, name):
-    if mdconfig.log_level <= logging.DEBUG:
-        with open(f"./log/{name}.dot", "w") as f:
-            f.write(str(FxGraphDrawer(gm, name).get_dot_graph()))
+    with open(f"./log/{name}.dot", "w") as f:
+        f.write(str(FxGraphDrawer(gm, name).get_dot_graph()))
 
 
 def _to_tuple(x):
@@ -102,9 +98,3 @@ class OneToOneMap:
         for k, v in dict.items():
             mapping.add(k, v)
         return mapping
-
-
-def do_spmd_comm(tensor, src_specs: List[Placement], tgt_specs: List[Placement]):
-    device_mesh = get_device_mesh('spmd')
-    dtensor = DTensor.from_local(tensor, device_mesh, src_specs)
-    return dtensor.redistribute(device_mesh, tgt_specs).to_local()

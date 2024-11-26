@@ -1,4 +1,4 @@
-# Copyright (c) 2023, Alibaba Group;
+# Copyright (c) 2024, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import functools
 from copy import deepcopy
 from functools import reduce
 
@@ -24,8 +23,6 @@ from torch.distributed._tensor import DeviceMesh
 from easydist import easydist_setup
 from easydist.torch.api import easydist_compile
 from easydist.torch.device_mesh import set_device_mesh
-from easydist.torch.experimental.pp.compile_pipeline import annotate_split_points
-from easydist.torch.experimental.pp.runtime import ScheduleDAPPLE, ScheduleGPipe
 from easydist.torch.utils import seed
 from easydist.utils.testing import spawn
 from tests.test_torch.test_utils import (
@@ -54,24 +51,19 @@ class Foo(torch.nn.Module):
 BATCH_SIZE = 64
 
 
-def inner(module_cls, split_ann, schedule_cls, optim, spmd_size):
+def inner(module_cls, optim, spmd_size):
     seed()
     easydist_setup(backend="torch", device="cuda", allow_tf32=False)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     torch.cuda.set_device(rank)
-    spmd_world_size = functools.reduce((lambda x, y: x * y), spmd_size)
-    if spmd_world_size == world_size:
-        set_device_mesh(DeviceMesh("cuda", torch.arange(world_size).reshape(*spmd_size), mesh_dim_names=[*[f'spmd{i}' for i in range(len(spmd_size))]]))
-    else:
-        set_device_mesh(DeviceMesh("cuda", torch.arange(world_size).reshape(-1, *spmd_size), mesh_dim_names=['pp', *[f'spmd{i}' for i in range(len(spmd_size))]]))
+    set_device_mesh(DeviceMesh("cuda", torch.arange(world_size).reshape(*spmd_size), mesh_dim_names=[f'spmd{i}' for i in range(len(spmd_size))]))
 
     device = torch.device("cuda")
     module_torch = module_cls().to(device)
     module_torch = broadcast_module(module_torch)
     module_auto = deepcopy(module_torch)
-    if split_ann is not None:
-        annotate_split_points(module_auto, split_ann)
+
     rtol, atol = 1e-4, 1e-5  # TODO @botbw: spmd precision loss?
     if optim == 'adam':
         opt_torch = torch.optim.Adam(module_torch.parameters(), lr=1e-5, foreach=True, capturable=True)
@@ -85,7 +77,7 @@ def inner(module_cls, split_ann, schedule_cls, optim, spmd_size):
     num_chunks = world_size * 4 if reduce(lambda a, b: a * b, spmd_size) != world_size else 1  # if pure spmd, disable microbatches
     assert BATCH_SIZE % num_chunks == 0, f"only support fix micro batch size {BATCH_SIZE=} {num_chunks=}"
     assert (BATCH_SIZE // num_chunks) % 2 == 0, f"microbatch size must be divided by 2 (spmd)"
-    compiled_auto = easydist_compile(train_step, 'auto', 'fake', cuda_graph=False, schedule_cls=schedule_cls, num_chunks=num_chunks, strict=True)
+    compiled_auto = easydist_compile(train_step, 'auto', 'fake', cuda_graph=False, schedule_cls=None, num_chunks=num_chunks, strict=True)
 
     steps = 5
     if module_cls is TEST_GPT:
@@ -106,7 +98,7 @@ def inner(module_cls, split_ann, schedule_cls, optim, spmd_size):
         out_torch, _, _ = train_step_chunked(data, module_torch, opt_torch, num_chunks)
         out_auto = compiled_auto(data, module_auto, opt_auto)
 
-        assert torch.allclose(out_torch.mean(), out_auto.mean().to(device), rtol=rtol, atol=atol)  # elementwise comparison will fail
+        assert torch.allclose(out_torch, out_auto.to(device), rtol=rtol, atol=atol)
 
         params_torch, buffers_torch, optimstates_torch = get_module_opt_states(module_torch, opt_torch, False)
         params_compiled = compiled_auto.compiled_func.named_parameters()
@@ -124,51 +116,39 @@ def inner(module_cls, split_ann, schedule_cls, optim, spmd_size):
 @pytest.mark.torch
 @pytest.mark.world_2
 @pytest.mark.long_duration
-@pytest.mark.parametrize("module_cls, split_ann, schedule_cls, optim", [
-    (Foo, None, None, 'adam'),
-    (Foo, None, None, 'sgd'),
-    (TEST_GPT, None, None, 'adam'),
-    (TEST_GPT, None, None, 'sgd'),
+@pytest.mark.parametrize("module_cls, optim", [
+    (Foo, 'adam'),
+    (Foo, 'sgd'),
+    (TEST_GPT, 'adam'),
+    (TEST_GPT, 'sgd'),
 ])
 @pytest.mark.timeout(100)
-def test_runtime_world_2(module_cls, split_ann, schedule_cls, optim):
-    spawn(inner, (module_cls, split_ann, schedule_cls, optim, (2, )), nprocs=2, port=12345)
+def test_runtime_world_2(module_cls, optim):
+    spawn(inner, (module_cls, optim, (2, )), nprocs=2, port=12345)
 
 
 @pytest.mark.torch
 @pytest.mark.world_4
 @pytest.mark.long_duration
-@pytest.mark.parametrize("module_cls, split_ann, schedule_cls, optim", [
-    (Foo, {'norm'}, ScheduleGPipe, 'adam'),
-    (Foo, {'norm'}, ScheduleGPipe, 'sgd'),
-    (Foo, {'norm'}, ScheduleDAPPLE, 'adam'),
-    (Foo, {'norm'}, ScheduleDAPPLE, 'sgd'),
-    (TEST_GPT, {'blocks.1'}, ScheduleDAPPLE, 'adam'),
+@pytest.mark.parametrize("module_cls, optim, spmd_size", [
+    (Foo, 'sgd', (4,)),
+    (Foo, 'sgd', (2, 2)),
+    (TEST_GPT, 'sgd', (4,)),
+    (TEST_GPT, 'sgd', (2, 2)),
 ])
 @pytest.mark.timeout(200)
-def test_runtime_world_4(module_cls, split_ann, schedule_cls, optim):
-    spawn(inner, (module_cls, split_ann, schedule_cls, optim, (2, )), nprocs=4, port=12345)
-
-
-@pytest.mark.torch
-@pytest.mark.world_4
-@pytest.mark.long_duration
-@pytest.mark.parametrize("module_cls, split_ann, schedule_cls, optim", [
-    (Foo, None, None, 'adam'),
-])
-@pytest.mark.timeout(200)
-def test_runtime_world_4_spmd_only(module_cls, split_ann, schedule_cls, optim):
-    spawn(inner, (module_cls, split_ann, schedule_cls, optim, (2, 2)), nprocs=4, port=12345)
+def test_runtime_world_4(module_cls, optim, spmd_size):
+    spawn(inner, (module_cls, optim, spmd_size), nprocs=4, port=12345)
 
 
 @pytest.mark.torch
 @pytest.mark.world_8
 @pytest.mark.long_duration
-@pytest.mark.parametrize("module_cls, split_ann, schedule_cls, optim, spmd_size", [
-    (TEST_GPT, {'blocks.0', 'blocks.1', 'blocks.2'}, ScheduleDAPPLE, 'adam', (2, )),
-    (TEST_GPT, {'blocks.1'}, ScheduleDAPPLE, 'adam', (2, 2)),
-    (TEST_GPT, None, None, 'adam', (2, 4)),
+@pytest.mark.parametrize("module_cls, optim, spmd_size", [
+    (TEST_GPT, 'sgd', (8, )),
+    (TEST_GPT, 'sgd', (4, 2)),
+    (TEST_GPT, 'sgd', (2, 2, 2)),
 ])
-@pytest.mark.timeout(400)
-def test_runtime_world_8(module_cls, split_ann, schedule_cls, optim, spmd_size):
-    spawn(inner, (module_cls, split_ann, schedule_cls, optim, spmd_size), nprocs=8, port=12345)
+@pytest.mark.timeout(200)
+def test_runtime_world_8(module_cls, optim, spmd_size):
+    spawn(inner, (module_cls, optim, spmd_size), nprocs=8, port=12345)

@@ -37,10 +37,10 @@ from easydist.torch.experimental.pp.split_utils import (
 from easydist.torch.experimental.pp.utils import (
     OneToOneMap,
     _to_tuple,
-    do_spmd_comm,
     ordered_gi_users,
     save_graphviz_dot,
 )
+from easydist.torch.utils import do_spmd_comm
 from easydist.utils import rgetattr, rsetattr
 
 # ================================= section start ========================================
@@ -313,7 +313,6 @@ class EDGraphModule:
     def __call__(self, *args, **kwargs):
         return self.gm(*args, **kwargs)
 
-
 class CompiledStage:
 
     def __init__(self,
@@ -344,10 +343,10 @@ class CompiledStage:
 
         if full_step_gm is not None:
             self.has_step = True
-            stage_optim_input_params = set(
+            self.stage_optim_input_params = set(
                 compiled_meta.input_node_to_step_input_params.get(node_name) for node_name in stage_param_nodes
             )
-            stage_optim_input_grads = set(
+            self.stage_optim_input_grads = set(
                 compiled_meta.input_node_to_step_input_grads.get(node_name) for node_name in stage_param_nodes
             )
             stage_optim_input_states = set(
@@ -355,20 +354,21 @@ class CompiledStage:
                     (compiled_meta.input_params_map.inv_get(node_name), state_type)
                 ) for node_name in stage_param_nodes for state_type in compiled_meta.optim_state_types
             )
-            self.optim_grads = stage_optim_input_grads
-            self.step_func_args = (stage_optim_input_params | stage_optim_input_grads) | stage_optim_input_states
+            self.step_func_args = self.stage_optim_input_params | self.stage_optim_input_grads | stage_optim_input_states
             self.stage_step_gm = _extract_step_subgraph_from_args(full_step_gm, self.step_func_args)
             save_graphviz_dot(self.stage_step_gm.gm, self.fw_gm.name + '(step)')
 
     @torch.no_grad
-    def forward(self, saved_tensors_bw: Optional[Dict]=None, returns_chunk: Optional[Dict]=None, **kwargs):
+    def forward(self, saved_tensors_bw: Optional[Dict]=None, saved_params_step: Optional[Dict]=None, returns_chunk: Optional[Dict]=None, **kwargs):
         assert set(kwargs.keys()) == self.fw_func_args, f"known kwargs {kwargs}, {self.fw_func_args} are required"
 
-        if saved_tensors_bw is None or returns_chunk is None:  # for local run
-            assert saved_tensors_bw is None and returns_chunk is None
+        if saved_tensors_bw is None or returns_chunk is None or saved_params_step is None:  # for local run
+            assert saved_tensors_bw is None and returns_chunk is None and saved_params_step is None
             self.saved_tensors_bw = {}
+            self.saved_params_step = {}
             self.returns = {}
             saved_tensors_bw = self.saved_tensors_bw
+            saved_params_step = self.saved_params_step
             returns_chunk = self.returns
 
         kwargs_gm = {}
@@ -381,6 +381,9 @@ class CompiledStage:
                 kwargs_gm[arg_name] = self.fw_gm.node_states[StateType.BUFFERS][arg_name]
             else:
                 raise RuntimeError(f"arg {arg_name} not found")
+
+            if self.has_step and arg_name in self.stage_optim_input_params:
+                saved_params_step[arg_name] = kwargs_gm[arg_name]
 
             if self.has_bw and arg_name in self.tensors_to_save_bw:
                 saved_tensors_bw[arg_name] = kwargs_gm[arg_name]
@@ -409,19 +412,24 @@ class CompiledStage:
             if self.has_bw and output_name in self.tensors_to_save_bw:
                 saved_tensors_bw[output_name] = output
 
+            if self.has_step and output_name in self.stage_optim_input_params:
+                saved_params_step[output_name] = output
+
         return ret
 
     @torch.no_grad
-    def backward(self, saved_tensors_bw: Optional[Dict]=None, grads: Optional[Dict]=None, **kwargs):
+    def backward(self, saved_tensors_bw: Optional[Dict]=None, saved_grads_step: Optional[Dict]=None, grads: Optional[Dict]=None, **kwargs):
         if not self.has_bw:
             raise NotImplementedError("This compiled stage doesn't contain bw_gm")
 
         assert set(kwargs.keys()) == self.bw_func_args, "backward args should be saved for fw"
 
-        if saved_tensors_bw is None or grads is None:  # for local run
-            assert saved_tensors_bw is None and grads is None
-            self.grads = {}
+        if saved_tensors_bw is None or saved_grads_step is None or grads is None:  # for local run
+            assert saved_tensors_bw is None and saved_grads_step is None and grads is None
             saved_tensors_bw = self.saved_tensors_bw
+            self.saved_grads_step = {}
+            saved_grads_step = self.saved_grads_step
+            self.grads = {}
             grads = self.grads
 
         kwargs_gm = {}
@@ -444,22 +452,29 @@ class CompiledStage:
         for output_name, output in zip(self.bw_gm.outputs_spec, output_gm):
             if output_name in self.bw_func_returns:
                 ret[output_name] = output
-            else:
+
+            if output_name in self.compiled_meta.output_grads_map.inv_keys():
                 grads[output_name] = output
+
+            if self.has_step and output_name in self.stage_optim_input_grads:
+                saved_grads_step[output_name] = output
 
         return ret
 
     @torch.no_grad
-    def step(self, grads: Optional[Dict]=None):
+    def step(self, saved_params_step: Optional[Dict]=None, saved_grads_step: Optional[Dict]=None):
         if not self.has_step:
             raise NotImplementedError("This compiled stage doesn't contain step_gm")
 
-        if grads is None:
-            grads = self.grads
+        if saved_params_step is None or saved_grads_step is None:
+            assert saved_params_step is None and saved_grads_step is None
+            saved_params_step = self.saved_params_step
+            saved_grads_step = self.saved_grads_step
 
         with torch.profiler.record_function("actual_compute"):
-            output_gm = self.stage_step_gm(**grads, **self.stage_step_gm.node_states[StateType.OPTIMSTATES], **self.fw_gm.node_states[StateType.PARAMS])
-        grads.clear()
+            output_gm = self.stage_step_gm(**saved_params_step, **saved_grads_step, **self.stage_step_gm.node_states[StateType.OPTIMSTATES])
+        saved_params_step.clear()
+        saved_grads_step.clear()
 
         for output_name, output in zip(self.stage_step_gm.outputs_spec, output_gm):
             if output_name in self.compiled_meta.output_params_map.inv_keys():  # updated params
@@ -475,12 +490,6 @@ class CompiledStage:
 
         return None
 
-    def has_step(self):
-        return hasattr(self, 'step_gm')
-
-    def has_bw(self):
-        return hasattr(self, 'bw_gm')
-
     def state_dict(self) -> Dict[str, Any]:
         state_dict = {}
         state_dict.update(self.named_parameters())
@@ -492,8 +501,8 @@ class CompiledStage:
         for torch_name, tensor in state_dict.items():
             node_name = self.compiled_meta.input_params_map.get(torch_name)
             if node_name in self.compiled_meta.tensors_spmd_strategies:
-                src_specs = [Replicate()] * len(src_specs)
                 tgt_specs = self.compiled_meta.tensors_spmd_strategies[node_name]
+                src_specs = [Replicate()] * len(tgt_specs)
                 tensor = do_spmd_comm(tensor, src_specs, tgt_specs)
             self.fw_gm.node_states[StateType.PARAMS][node_name] = tensor
             to_pop.append(torch_name)
@@ -505,8 +514,8 @@ class CompiledStage:
         for torch_name, tensor in state_dict.items():
             node_name = self.compiled_meta.input_buffers_map.get(torch_name)
             if node_name in self.compiled_meta.tensors_spmd_strategies:
-                src_specs = [Replicate()] * len(src_specs)
                 tgt_specs = self.compiled_meta.tensors_spmd_strategies[node_name]
+                src_specs = [Replicate()] * len(tgt_specs)
                 tensor = do_spmd_comm(tensor, src_specs, tgt_specs)
             self.fw_gm.node_states[StateType.BUFFERS][node_name] = tensor
             to_pop.append(torch_name)
@@ -524,8 +533,8 @@ class CompiledStage:
             for state_type, tensor in states.items():
                 node_name = self.compiled_meta.input_optimstates_map.get((torch_name, state_type))
                 if node_name in self.compiled_meta.tensors_spmd_strategies:
-                    src_specs = [Replicate()] * len(src_specs)
                     tgt_specs = self.compiled_meta.tensors_spmd_strategies[node_name]
+                    src_specs = [Replicate()] * len(tgt_specs)
                     tensor = do_spmd_comm(tensor, src_specs, tgt_specs)
                 self.stage_step_gm.node_states[StateType.OPTIMSTATES][node_name] = tensor
 
@@ -973,6 +982,7 @@ def compile_pipeline(
         input_node_to_step_input_grads = OneToOneMap.from_dict({
             input_node_to_step_input_params.inv_get(param_node_name): grad_node_name for param_node_name, grad_node_name in zip(step_gm_phs[:num_params], step_gm_phs[num_params:2*num_params])
         })
+
 
     # meta data
     compiled_meta = CompiledMeta(
